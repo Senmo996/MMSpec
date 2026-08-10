@@ -6,3 +6,7 @@ MSD/
 EAGLE/
 *.log
 .hf_mirror/
+
+# Local evaluation artifacts and test caches.
+results/
+.pytest_cache/

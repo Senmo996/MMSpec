@@ -1144,6 +1144,81 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
+        # [MODIFIED] A packed verification tree gives its root query the same
+        # logical receptive field as ordinary q_len=1 decoding, but SDPA may
+        # still choose a different numerical path because the masked sibling
+        # keys remain in the physical tensor.  Recompute only that attention
+        # row against the real prefix plus root, then splice it into the packed
+        # result below.  Q/K/V projections, MLPs, and all descendant attention
+        # rows remain batched, so this is much cheaper than a second decoder
+        # pass for the root token.
+        original_q_len = q_len
+        exact_root_attention_rows = int(
+            getattr(self, "qshape_exact_root_attention_rows", 0)
+        )
+        exact_root_attn_output = None
+        if 1 < q_len <= exact_root_attention_rows:
+            cached_key_length = int(key_states.shape[-2]) - q_len
+            root_key_length = cached_key_length + 1
+            exact_root_attn_output = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    query_states[:, :, :1].contiguous(),
+                    key_states[:, :, :root_key_length].contiguous(),
+                    value_states[:, :, :root_key_length].contiguous(),
+                    attn_mask=None,
+                    dropout_p=(
+                        self.attention_dropout if self.training else 0.0
+                    ),
+                    is_causal=False,
+                )
+            )
+
+        # [MODIFIED] Canonicalize short-query SDPA shapes without writing
+        # padding rows into the reusable KV cache.  The real K/V rows were
+        # appended above; these zero rows exist only for this attention call.
+        fixed_attention_rows = int(
+            getattr(self, "qshape_fixed_rows", 0)
+        )
+        if 0 < q_len < fixed_attention_rows:
+            padding_rows = fixed_attention_rows - q_len
+            real_key_length = int(key_states.shape[-2])
+            fixed_key_block = int(
+                getattr(self, "qshape_fixed_key_block", 0)
+            )
+            provisional_key_length = real_key_length + padding_rows
+            if fixed_key_block > 0:
+                padded_key_length = (
+                    (provisional_key_length + fixed_key_block - 1)
+                    // fixed_key_block
+                    * fixed_key_block
+                )
+            else:
+                padded_key_length = provisional_key_length
+            key_padding_rows = padded_key_length - real_key_length
+            query_states = F.pad(query_states, (0, 0, 0, padding_rows))
+            key_states = F.pad(key_states, (0, 0, 0, key_padding_rows))
+            value_states = F.pad(value_states, (0, 0, 0, key_padding_rows))
+            minimum = torch.finfo(query_states.dtype).min
+            padded_mask = torch.full(
+                (
+                    bsz,
+                    1,
+                    fixed_attention_rows,
+                    padded_key_length,
+                ),
+                minimum,
+                dtype=query_states.dtype,
+                device=query_states.device,
+            )
+            if causal_mask is None:
+                padded_mask[:, :, :q_len, :real_key_length] = 0
+            else:
+                padded_mask[:, :, :q_len, :real_key_length] = causal_mask
+            # Keep discarded dummy-query rows numerically well defined.
+            padded_mask[:, :, q_len:, 0] = 0
+            causal_mask = padded_mask
+            q_len = fixed_attention_rows
+
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and attention_mask is not None:
@@ -1165,7 +1240,15 @@ class Qwen2_5_VLSdpaAttention(Qwen2_5_VLAttention):
             is_causal=is_causal,
         )
 
+        if exact_root_attn_output is not None:
+            attn_output = torch.cat(
+                [exact_root_attn_output, attn_output[:, :, 1:]], dim=2
+            )
+
         attn_output = attn_output.transpose(1, 2).contiguous()
+        if q_len != original_q_len:
+            attn_output = attn_output[:, :original_q_len]
+            q_len = original_q_len
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
@@ -1535,12 +1618,14 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         )
 
         # [MODIFIED]
-        if (
-            hasattr(self, "tree_mask")
-            and self.tree_mask is not None
-            and self.config._attn_implementation != "eager"
-        ):
-            tree_mask = self.tree_mask
+        if hasattr(self, "tree_mask") and self.tree_mask is not None:
+            # Tree verification requires sibling branches to remain causally
+            # isolated under every attention backend.  The previous eager
+            # exception silently fell back to the ordinary triangular mask,
+            # allowing an earlier flattened sibling to leak into later tree
+            # nodes and invalidating both acceptance and output-equivalence
+            # measurements.
+            tree_mask = self.tree_mask.to(device=causal_mask.device)
             tree_len = tree_mask.size(-1)
             causal_mask[:, :, -tree_len:, -tree_len - 1 : -1][
                 tree_mask == 0
@@ -1678,6 +1763,11 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
+    # The grounding-aware decoder only needs the final normalized language
+    # state.  Exposing it separately avoids retaining every decoder layer via
+    # ``output_hidden_states=True`` during long multimodal prefills and packed
+    # tree verification.
+    last_hidden_state: Optional[torch.FloatTensor] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -2029,6 +2119,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_last_hidden_state: bool = False,
         return_dict: Optional[bool] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.FloatTensor] = None,
@@ -2228,6 +2319,9 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
+            last_hidden_state=(
+                hidden_states if output_last_hidden_state else None
+            ),
         )
 
     def prepare_inputs_for_generation(

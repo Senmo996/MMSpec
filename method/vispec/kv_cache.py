@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 
@@ -87,6 +89,20 @@ class KVCache:
         self.data = torch.cat((self.data, pad), dim=dim)
 
 
+def resolve_initial_cache_capacity(config):
+    max_position_embeddings = int(getattr(config, "max_position_embeddings", 4096))
+    raw_capacity = os.environ.get("MMSPEC_LONG_CONTEXT_INITIAL_KV_CACHE_CAPACITY", "4096")
+    if raw_capacity in ("", "none", "None", "0"):
+        return max_position_embeddings
+    try:
+        capacity = int(raw_capacity)
+    except ValueError:
+        capacity = 4096
+    if capacity <= 0:
+        return max_position_embeddings
+    return min(max_position_embeddings, capacity)
+
+
 def initialize_past_key_values(model):
     """
     Initialize past key and value states for a given transformer model.
@@ -113,6 +129,7 @@ def initialize_past_key_values(model):
     config = cache_model.config
     if not hasattr(config, "num_hidden_layers") and hasattr(model.config, "text_config"):
         config = model.config.text_config
+    cache_capacity = resolve_initial_cache_capacity(config)
     # Initializing the batch size to 1, this can be modified if different batch sizes are required
     batch_size = 1
     # Initializing a tensor to store past keys and values for all layers
@@ -136,7 +153,7 @@ def initialize_past_key_values(model):
                 startnum * 2,
                 batch_size,
                 config.num_key_value_heads,
-                config.max_position_embeddings,
+                cache_capacity,
                 config.hidden_size // config.num_attention_heads,
                 device=startdevice,
                 dtype=cache_dtype,
@@ -149,7 +166,7 @@ def initialize_past_key_values(model):
         startnum * 2,
         batch_size,
         config.num_key_value_heads,
-        config.max_position_embeddings,
+        cache_capacity,
         config.hidden_size // config.num_attention_heads,
         device=startdevice,
         dtype=cache_dtype,
