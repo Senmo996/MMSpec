@@ -12,6 +12,12 @@ import torch
 import torch.nn.functional as F
 
 
+TRIGRAM_PLUS4_NODE_BUDGET_POLICIES = frozenset(
+    f"context-score-trigram-deeper-wide-plus4-node{budget}"
+    for budget in (23, 31, 39, 47, 55)
+)
+
+
 @dataclass(frozen=True)
 class DraftDecision:
     budget: int
@@ -142,8 +148,26 @@ class GroundedDraftController:
         "context-score-prior-deeper-wide-plus2",
         "context-score-prior-deeper-wide-plus4",
         "context-score-trigram-deeper-wide-plus4",
+        "context-score-trigram-residual2-deeper-wide-plus4",
+        "context-score-trigram-residual2-deepest-wide-plus4",
+        "context-score-trigram-fusion-deeper-wide-plus4",
+        "context-score-trigram-fusion-deepest-wide-plus4",
+        "context-score-trigram-fusion55-deepest-wide-plus4",
+        "context-score-trigram-fusion-adaptive-deepest-wide-plus4",
+        "context-score-trigram-fusion-calibrated-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-global15-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-ngram-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-ngram-global15-deepest-wide-plus4",
+        "context-score-trigram-fusion-bank-deepest-wide-plus4",
+        "context-score-trigram-fusion-bank-global15-deepest-wide-plus4",
+        "context-score-trigram-fusion-global7-deepest-wide-plus4",
+        "context-score-trigram-fusion-global15-deepest-wide-plus4",
+        "context-score-trigram-deepest-wide-plus4",
         "context-score-trigram-deeper-wide-plus6",
         "context-score-trigram-deeper-wide-plus8",
+        "context-score-fourgram-deeper-wide-plus4",
+        "context-score-fourgram-deepest-wide-plus4",
         "context-score-prior-deeper-wide-plus5",
         "context-score-prior-deeper-wide-plus6",
         "context-score-prior-deeper-wide-plus8",
@@ -189,7 +213,7 @@ class GroundedDraftController:
         "visual-anchor",
         "visual-soft",
         "visual-accept",
-    }
+    } | TRIGRAM_PLUS4_NODE_BUDGET_POLICIES
 
     def __init__(
         self,
@@ -240,8 +264,26 @@ class GroundedDraftController:
             "context-score-prior-deeper-wide-plus2",
             "context-score-prior-deeper-wide-plus4",
             "context-score-trigram-deeper-wide-plus4",
+            "context-score-trigram-residual2-deeper-wide-plus4",
+            "context-score-trigram-residual2-deepest-wide-plus4",
+            "context-score-trigram-fusion-deeper-wide-plus4",
+            "context-score-trigram-fusion-deepest-wide-plus4",
+            "context-score-trigram-fusion55-deepest-wide-plus4",
+            "context-score-trigram-fusion-adaptive-deepest-wide-plus4",
+            "context-score-trigram-fusion-calibrated-deepest-wide-plus4",
+            "context-score-trigram-fusion-persistent-deepest-wide-plus4",
+            "context-score-trigram-fusion-persistent-global15-deepest-wide-plus4",
+            "context-score-trigram-fusion-persistent-ngram-deepest-wide-plus4",
+            "context-score-trigram-fusion-persistent-ngram-global15-deepest-wide-plus4",
+            "context-score-trigram-fusion-bank-deepest-wide-plus4",
+            "context-score-trigram-fusion-bank-global15-deepest-wide-plus4",
+            "context-score-trigram-fusion-global7-deepest-wide-plus4",
+            "context-score-trigram-fusion-global15-deepest-wide-plus4",
+            "context-score-trigram-deepest-wide-plus4",
             "context-score-trigram-deeper-wide-plus6",
             "context-score-trigram-deeper-wide-plus8",
+            "context-score-fourgram-deeper-wide-plus4",
+            "context-score-fourgram-deepest-wide-plus4",
             "context-score-prior-deeper-wide-plus5",
             "context-score-prior-deeper-wide-plus6",
             "context-score-prior-deeper-wide-plus8",
@@ -277,7 +319,7 @@ class GroundedDraftController:
             "grounded-hybrid-reverse",
             "visual-width",
             "visual-width-reverse",
-        ):
+        ) or self.policy in TRIGRAM_PLUS4_NODE_BUDGET_POLICIES:
             budget, risk = self.max_draft_tokens, 0.0
         elif self.policy == "short":
             budget, risk = self.min_draft_tokens, 1.0

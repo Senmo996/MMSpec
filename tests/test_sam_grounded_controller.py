@@ -60,6 +60,87 @@ def test_cover_policy_prefix_validates_underlying_tree_policy():
         _parse_policies("cover-does-not-exist")
 
 
+def test_trigram_node_budget_policies_parse_and_cap_verifier_batch():
+    policies = [
+        f"context-score-trigram-deeper-wide-plus4-node{budget}"
+        for budget in (23, 31, 39, 47, 55)
+    ]
+    assert _parse_policies(",".join(policies)) == policies
+    for policy, expected in zip(policies, (23, 31, 39, 47, 55)):
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 63, None
+        ) == expected
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 15, 0.99
+        ) == 15
+
+
+def test_existing_adaptive_node_budgets_keep_their_thresholds():
+    choose = TreeRecyclingSpecModel._effective_tree_node_budget
+    assert choose("context-score-adaptive-safe-deeper-wide-plus2", 63, None) == 63
+    assert choose("context-score-adaptive-safe-deeper-wide-plus2", 63, 0.84) == 63
+    assert choose("context-score-adaptive-safe-deeper-wide-plus2", 63, 0.85) == 47
+    assert choose("score-adaptive-deeper-wide-plus2", 63, 0.74) == 63
+    assert choose("score-adaptive-deeper-wide-plus2", 63, 0.75) == 47
+    assert choose("score-adaptive-deeper-wide-plus2", 63, 0.90) == 31
+
+
+def test_reset_persistent_recycling_cache_clears_warmup_state():
+    model = TreeRecyclingSpecModel.__new__(TreeRecyclingSpecModel)
+    object.__setattr__(
+        model,
+        "_gwtr_persistent_unigram_caches",
+        {"policy": {"transitions": {1: [2]}, "scores": {1: [1.0]}}},
+    )
+    object.__setattr__(
+        model,
+        "_gwtr_persistent_unigram_banks",
+        {
+            "policy": {
+                "transitions": {1: [2]},
+                "scores": {1: [1.0]},
+                "counts": {1: 1},
+            }
+        },
+    )
+
+    model.reset_persistent_recycling_cache()
+
+    assert model._gwtr_persistent_unigram_caches == {}
+    assert model._gwtr_persistent_unigram_banks == {}
+
+
+def test_persistent_transition_merge_is_bounded_and_rewards_agreement():
+    row, scores, count = TreeRecyclingSpecModel._merge_persistent_transition_row(
+        [1, 2, 3],
+        [0.6, 0.3, 0.1],
+        3,
+        [2, 4, 1],
+        [0.5, 0.3, 0.2],
+        3,
+    )
+
+    assert row == [1, 2, 3]
+    assert count == 4
+    assert sum(scores) == pytest.approx(1.0)
+
+
+def test_bounded_transition_row_refreshes_and_evicts_oldest():
+    rows = {"old": [1], "keep": [2]}
+    scores = {"old": [1.0], "keep": [1.0]}
+
+    TreeRecyclingSpecModel._store_bounded_transition_row(
+        rows, scores, "new", [3], [1.0], 2
+    )
+    TreeRecyclingSpecModel._store_bounded_transition_row(
+        rows, scores, "keep", [4], [1.0], 2
+    )
+
+    assert list(rows) == ["new", "keep"]
+    assert rows["keep"] == [4]
+    assert set(scores) == {"new", "keep"}
+
+
 def test_visual_lexical_backoff_policies_parse_and_route_only_unseen_visual_roots():
     assert _parse_policies(
         "visual-lexical-backoff,visual-hst-backoff,visual-hst-backoff-gated,visual-wide-plus2-hst-backoff,visual-wide-plus2-hst-backoff-gated,visual-rootwide-plus2,visual-rootwide-plus2-hst-backoff,visual-wide-plus2-vli-backoff"
@@ -265,11 +346,54 @@ def test_tree_shape_uses_configured_visual_thresholds():
         "context-score-trigram-deeper-wide-plus4", *common
     ) == (8, 4)
     assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-residual2-deeper-wide-plus4", *common
+    ) == (8, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-residual2-deepest-wide-plus4", *common
+    ) == (8, 5)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-fusion-deeper-wide-plus4", *common
+    ) == (8, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-fusion-deepest-wide-plus4", *common
+    ) == (8, 5)
+    for policy in (
+        "context-score-trigram-fusion55-deepest-wide-plus4",
+        "context-score-trigram-fusion-adaptive-deepest-wide-plus4",
+        "context-score-trigram-fusion-calibrated-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-global15-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-ngram-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-ngram-global15-deepest-wide-plus4",
+        "context-score-trigram-fusion-bank-deepest-wide-plus4",
+        "context-score-trigram-fusion-bank-global15-deepest-wide-plus4",
+    ):
+        assert TreeRecyclingSpecModel._tree_shape(policy, *common) == (8, 5)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-fusion-global7-deepest-wide-plus4", *common
+    ) == (8, 5)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-fusion-global15-deepest-wide-plus4", *common
+    ) == (8, 5)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-deepest-wide-plus4", *common
+    ) == (8, 5)
+    for budget in (23, 31, 39, 47, 55):
+        assert TreeRecyclingSpecModel._tree_shape(
+            f"context-score-trigram-deeper-wide-plus4-node{budget}", *common
+        ) == (8, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
         "context-score-trigram-deeper-wide-plus6", *common
     ) == (10, 4)
     assert TreeRecyclingSpecModel._tree_shape(
         "context-score-trigram-deeper-wide-plus8", *common
     ) == (12, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-fourgram-deeper-wide-plus4", *common
+    ) == (8, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-fourgram-deepest-wide-plus4", *common
+    ) == (8, 5)
     assert TreeRecyclingSpecModel._tree_shape(
         "context-score-prior-deeper-wide-plus5", *common
     ) == (9, 4)
@@ -571,6 +695,182 @@ def test_trigram_score_tree_precedes_bigram_and_records_two_token_context():
     assert paths[:2] == [[1], [1, 2]]
     assert metadata["semantic_previous_tokens"] == [9, 0, 2, 0]
     assert metadata["semantic_previous_previous_tokens"] == [8, 9, 0, 9]
+
+
+def test_fourgram_score_tree_precedes_trigram_and_records_three_token_context():
+    transitions = torch.empty(0, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+    host = {0: [1, 2], 2: [3, 4]}
+    scores = {0: [0.9, 0.1], 2: [0.9, 0.1]}
+    context = {(9, 0): [1, 2], (0, 2): [3, 4]}
+    context_scores = {(9, 0): [0.9, 0.1], (0, 2): [0.9, 0.1]}
+    trigrams = {(8, 9, 0): [2, 1], (9, 0, 2): [4, 3]}
+    trigram_scores = {(8, 9, 0): [0.9, 0.1], (9, 0, 2): [0.9, 0.1]}
+    fourgrams = {(7, 8, 9, 0): [1, 2], (8, 9, 0, 1): [3, 4]}
+    fourgram_scores = {
+        (7, 8, 9, 0): [0.9, 0.1],
+        (8, 9, 0, 1): [0.9, 0.1],
+    }
+    metadata = {}
+
+    tokens, _, positions, paths = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=2,
+        node_budget=3,
+        blocked_token_id=None,
+        host_transitions=host,
+        host_transition_scores=scores,
+        root_previous_token=9,
+        root_previous_previous_token=8,
+        root_previous_previous_previous_token=7,
+        host_context_transitions=context,
+        host_context_transition_scores=context_scores,
+        host_trigram_transitions=trigrams,
+        host_trigram_transition_scores=trigram_scores,
+        host_fourgram_transitions=fourgrams,
+        host_fourgram_transition_scores=fourgram_scores,
+        metadata_out=metadata,
+        score_priority_layout=True,
+    )
+
+    assert tokens == [0, 1, 3, 2]
+    assert positions.tolist() == [0, 1, 2, 1]
+    assert paths[:2] == [[1], [1, 2]]
+    assert metadata["semantic_previous_tokens"] == [9, 0, 1, 0]
+    assert metadata["semantic_previous_previous_tokens"] == [8, 9, 0, 9]
+    assert metadata["semantic_previous_previous_previous_tokens"] == [
+        7,
+        8,
+        9,
+        8,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_tokens"),
+    [
+        ("strict", [0, 1, 2, 3, 4]),
+        ("residual2", [0, 1, 2, 5, 6]),
+        ("fusion", [0, 1, 2, 3, 5]),
+        ("fusion55", [0, 1, 2, 5, 3]),
+        ("fusion_adaptive", [0, 1, 2, 5, 3]),
+    ],
+)
+def test_context_candidate_modes_mix_lower_order_fallbacks(
+    mode, expected_tokens
+):
+    transitions = torch.empty(0, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+    host = {0: [7, 8, 1, 2]}
+    scores = {0: [0.6, 0.2, 0.1, 0.1]}
+    contexts = {(9, 0): [5, 6, 1, 2]}
+    context_scores = {(9, 0): [0.6, 0.2, 0.1, 0.1]}
+    trigrams = {(8, 9, 0): [1, 2, 3, 4]}
+    trigram_scores = {(8, 9, 0): [0.4, 0.3, 0.2, 0.1]}
+
+    tokens, _, _, _ = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=4,
+        depth=1,
+        node_budget=4,
+        blocked_token_id=None,
+        host_transitions=host,
+        host_transition_scores=scores,
+        root_previous_token=9,
+        root_previous_previous_token=8,
+        host_context_transitions=contexts,
+        host_context_transition_scores=context_scores,
+        host_trigram_transitions=trigrams,
+        host_trigram_transition_scores=trigram_scores,
+        context_candidate_mode=mode,
+        score_priority_layout=True,
+    )
+
+    assert tokens == expected_tokens
+
+
+def test_global_candidates_only_fill_an_unseen_host_row():
+    transitions = torch.empty(0, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+
+    tokens, _, positions, paths = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=4,
+        depth=1,
+        node_budget=3,
+        blocked_token_id=None,
+        host_transitions={},
+        host_transition_scores={},
+        host_global_candidates=[5, 6, 7, 8],
+        host_global_candidate_scores=[0.4, 0.3, 0.2, 0.1],
+        score_priority_layout=True,
+    )
+
+    assert tokens == [0, 5, 6, 7]
+    assert positions.tolist() == [0, 1, 1, 1]
+    assert paths == [[1], [2], [3]]
+
+    tokens, _, _, _ = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=1,
+        node_budget=2,
+        blocked_token_id=None,
+        host_transitions={0: [1, 2]},
+        host_transition_scores={0: [0.75, 0.25]},
+        host_global_candidates=[5, 6],
+        host_global_candidate_scores=[0.6, 0.4],
+        score_priority_layout=True,
+    )
+    assert tokens == [0, 1, 2]
+
+
+def test_persistent_candidates_are_a_lower_order_fallback():
+    transitions = torch.empty(0, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+
+    tokens, _, _, _ = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=1,
+        node_budget=2,
+        blocked_token_id=None,
+        host_transitions={},
+        host_transition_scores={},
+        host_persistent_transitions={0: [5, 6]},
+        host_persistent_transition_scores={0: [0.7, 0.3]},
+        context_candidate_mode="fusion",
+        score_priority_layout=True,
+    )
+    assert tokens == [0, 5, 6]
+
+    tokens, _, _, _ = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=1,
+        node_budget=2,
+        blocked_token_id=None,
+        host_transitions={0: [1, 2]},
+        host_transition_scores={0: [0.7, 0.3]},
+        host_persistent_transitions={0: [5, 6]},
+        host_persistent_transition_scores={0: [0.7, 0.3]},
+        context_candidate_mode="strict",
+        score_priority_layout=True,
+    )
+    assert tokens == [0, 1, 2]
 
 
 def test_best_verified_path_uses_longest_matching_branch():

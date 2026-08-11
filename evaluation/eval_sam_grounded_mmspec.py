@@ -267,6 +267,11 @@ def evaluate(args):
                 log=True,
                 **_policy_kwargs(args, policy),
             )
+    reset_persistent_cache = getattr(
+        model, "reset_persistent_recycling_cache", None
+    )
+    if callable(reset_persistent_cache):
+        reset_persistent_cache()
     print("Warmup done")
 
     for sample_index, sample in enumerate(tqdm(data, desc="Evaluating interleaved policies")):
