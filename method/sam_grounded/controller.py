@@ -17,6 +17,58 @@ TRIGRAM_PLUS4_NODE_BUDGET_POLICIES = frozenset(
     for budget in (23, 31, 39, 47, 55)
 )
 
+PERSISTENT_FUSION_NODE_BUDGET_POLICIES = frozenset(
+    f"context-score-trigram-fusion-persistent-node{budget}-deepest-wide-plus4"
+    for budget in (39, 47, 55, 63, 79, 95)
+)
+
+PERSISTENT_COMMITTED_POLICIES = frozenset(
+    {"context-score-trigram-fusion-persistent-committed-deepest-wide-plus4"}
+)
+
+PERSISTENT_STABLE_NODE_BUDGET_POLICIES = frozenset(
+    f"context-score-trigram-fusion-persistent-stable-node{budget}-deepest-wide-plus4"
+    for budget in (55, 63)
+)
+
+PERSISTENT_DEPTH_NODE_BUDGET_POLICIES = frozenset(
+    f"context-score-trigram-fusion-persistent-depth{depth}-node{budget}-wide-plus4"
+    for depth, budget in (
+        (7, 63),
+        (8, 55),
+        (8, 63),
+        (10, 47),
+        (10, 55),
+        (10, 63),
+        (10, 79),
+        (10, 95),
+    )
+)
+
+PERSISTENT_ADAPTIVE_DEPTH_POLICIES = frozenset(
+    {
+        "context-score-trigram-fusion-persistent-adaptive95-"
+        "depth10-wide-plus4"
+    }
+)
+
+PERSISTENT_OPTIMIZED_DEPTH_POLICIES = frozenset(
+    {
+        "context-score-trigram-fusion-persistent-contextcal-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-shadow-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-hotpath-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
+        "depth10-node95-wide-plus4",
+    }
+)
+
 
 @dataclass(frozen=True)
 class DraftDecision:
@@ -213,7 +265,15 @@ class GroundedDraftController:
         "visual-anchor",
         "visual-soft",
         "visual-accept",
-    } | TRIGRAM_PLUS4_NODE_BUDGET_POLICIES
+    } | (
+        TRIGRAM_PLUS4_NODE_BUDGET_POLICIES
+        | PERSISTENT_FUSION_NODE_BUDGET_POLICIES
+        | PERSISTENT_COMMITTED_POLICIES
+        | PERSISTENT_STABLE_NODE_BUDGET_POLICIES
+        | PERSISTENT_DEPTH_NODE_BUDGET_POLICIES
+        | PERSISTENT_ADAPTIVE_DEPTH_POLICIES
+        | PERSISTENT_OPTIMIZED_DEPTH_POLICIES
+    )
 
     def __init__(
         self,
@@ -319,7 +379,15 @@ class GroundedDraftController:
             "grounded-hybrid-reverse",
             "visual-width",
             "visual-width-reverse",
-        ) or self.policy in TRIGRAM_PLUS4_NODE_BUDGET_POLICIES:
+        ) or self.policy in (
+            TRIGRAM_PLUS4_NODE_BUDGET_POLICIES
+            | PERSISTENT_FUSION_NODE_BUDGET_POLICIES
+            | PERSISTENT_COMMITTED_POLICIES
+            | PERSISTENT_STABLE_NODE_BUDGET_POLICIES
+            | PERSISTENT_DEPTH_NODE_BUDGET_POLICIES
+            | PERSISTENT_ADAPTIVE_DEPTH_POLICIES
+            | PERSISTENT_OPTIMIZED_DEPTH_POLICIES
+        ):
             budget, risk = self.max_draft_tokens, 0.0
         elif self.policy == "short":
             budget, risk = self.min_draft_tokens, 1.0

@@ -36,6 +36,71 @@ TRIGRAM_PLUS4_NODE_BUDGETS = {
     for budget in (23, 31, 39, 47, 55)
 }
 
+PERSISTENT_FUSION_NODE_BUDGETS = {
+    f"context-score-trigram-fusion-persistent-node{budget}-deepest-wide-plus4": budget
+    for budget in (39, 47, 55, 63, 79, 95)
+}
+
+PERSISTENT_COMMITTED_POLICIES = {
+    "context-score-trigram-fusion-persistent-committed-deepest-wide-plus4"
+}
+
+PERSISTENT_STABLE_NODE_BUDGETS = {
+    f"context-score-trigram-fusion-persistent-stable-node{budget}-deepest-wide-plus4": budget
+    for budget in (55, 63)
+}
+
+PERSISTENT_DEPTH_NODE_CONFIGS = {
+    f"context-score-trigram-fusion-persistent-depth{depth}-node{budget}-wide-plus4": (
+        budget,
+        depth,
+    )
+    for depth, budget in (
+        (7, 63),
+        (8, 55),
+        (8, 63),
+        (10, 47),
+        (10, 55),
+        (10, 63),
+        (10, 79),
+        (10, 95),
+    )
+}
+
+PERSISTENT_ADAPTIVE_DEPTH_POLICIES = {
+    "context-score-trigram-fusion-persistent-adaptive95-depth10-wide-plus4"
+}
+
+PERSISTENT_OPTIMIZED_DEPTH_CONFIGS = {
+    "context-score-trigram-fusion-persistent-contextcal-"
+    "depth10-node63-wide-plus4": (63, 10),
+    "context-score-trigram-fusion-persistent-shadow-"
+    "depth10-node63-wide-plus4": (63, 10),
+    "context-score-trigram-fusion-persistent-contextnodes-"
+    "depth10-node63-wide-plus4": (63, 10),
+    "context-score-trigram-fusion-persistent-contextnodes-hotpath-"
+    "depth10-node63-wide-plus4": (63, 10),
+    "context-score-trigram-fusion-persistent-contextnodes-hotpath-cpp-"
+    "depth10-node63-wide-plus4": (63, 10),
+    "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
+    "depth10-node95-wide-plus4": (95, 10),
+}
+
+CONTEXT_PLUS4_SPECIAL_POLICIES = frozenset(
+    TRIGRAM_PLUS4_NODE_BUDGETS
+) | frozenset(PERSISTENT_FUSION_NODE_BUDGETS) | frozenset(
+    PERSISTENT_COMMITTED_POLICIES
+) | frozenset(PERSISTENT_STABLE_NODE_BUDGETS)
+CONTEXT_PLUS4_SPECIAL_POLICIES |= frozenset(
+    PERSISTENT_DEPTH_NODE_CONFIGS
+)
+CONTEXT_PLUS4_SPECIAL_POLICIES |= frozenset(
+    PERSISTENT_ADAPTIVE_DEPTH_POLICIES
+)
+CONTEXT_PLUS4_SPECIAL_POLICIES |= frozenset(
+    PERSISTENT_OPTIMIZED_DEPTH_CONFIGS
+)
+
 GLOBAL_BACKOFF_POLICIES = {
     "context-score-trigram-fusion-global7-deepest-wide-plus4": (7, 1),
     "context-score-trigram-fusion-global15-deepest-wide-plus4": (15, 2),
@@ -67,6 +132,26 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         persistent_banks = getattr(self, "_gwtr_persistent_unigram_banks", None)
         if persistent_banks is not None:
             persistent_banks.clear()
+
+    @staticmethod
+    def _select_prompt_transition_rows(
+        prompt_values,
+        cached_tokens=None,
+    ):
+        """Return first occurrences, optionally excluding persistent hits."""
+
+        cached = cached_tokens if cached_tokens is not None else ()
+        seen = set()
+        indices = []
+        values = []
+        for prompt_index, token in enumerate(prompt_values):
+            token = int(token)
+            if token in seen or token in cached:
+                continue
+            seen.add(token)
+            indices.append(prompt_index)
+            values.append(token)
+        return indices, values
 
     @staticmethod
     def _layerwise_verification_diagnostics(
@@ -315,6 +400,18 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "visual-hst-backoff-gated",
         ):
             return broad_width, shallow_depth
+        if policy in PERSISTENT_DEPTH_NODE_CONFIGS:
+            return (
+                broad_width + 4,
+                PERSISTENT_DEPTH_NODE_CONFIGS[policy][1],
+            )
+        if policy in PERSISTENT_ADAPTIVE_DEPTH_POLICIES:
+            return broad_width + 4, 10
+        if policy in PERSISTENT_OPTIMIZED_DEPTH_CONFIGS:
+            return (
+                broad_width + 4,
+                PERSISTENT_OPTIMIZED_DEPTH_CONFIGS[policy][1],
+            )
         context_width_augmentation = {
             "context-score-prior-deeper-wide-plus4": 4,
             "context-score-trigram-deeper-wide-plus4": 4,
@@ -342,7 +439,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "context-score-prior-deeper-wide-plus6": 6,
             "context-score-prior-deeper-wide-plus8": 8,
         }.get(policy)
-        if policy in TRIGRAM_PLUS4_NODE_BUDGETS:
+        if policy in CONTEXT_PLUS4_SPECIAL_POLICIES:
             context_width_augmentation = 4
         if context_width_augmentation is not None:
             depth_augmentation = (
@@ -473,12 +570,41 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         policy: str,
         configured_budget: int,
         root_transition_top_probability: Optional[float],
+        root_transition_context_order: int = 0,
     ) -> int:
         """Choose a verifier batch budget without changing tree ranking."""
 
         budget = int(configured_budget)
         if policy in TRIGRAM_PLUS4_NODE_BUDGETS:
             return min(budget, TRIGRAM_PLUS4_NODE_BUDGETS[policy])
+        if policy in PERSISTENT_FUSION_NODE_BUDGETS:
+            return min(budget, PERSISTENT_FUSION_NODE_BUDGETS[policy])
+        if policy in PERSISTENT_STABLE_NODE_BUDGETS:
+            return min(budget, PERSISTENT_STABLE_NODE_BUDGETS[policy])
+        if policy in PERSISTENT_DEPTH_NODE_CONFIGS:
+            return min(budget, PERSISTENT_DEPTH_NODE_CONFIGS[policy][0])
+        if policy in PERSISTENT_ADAPTIVE_DEPTH_POLICIES:
+            if (
+                root_transition_top_probability is not None
+                and 0.4 <= root_transition_top_probability < 0.7
+            ):
+                return min(budget, 95)
+            return min(budget, 63)
+        if "-contextnodes95-" in policy:
+            context_order = int(root_transition_context_order)
+            selected_budget = 47 if context_order <= 1 else (
+                63 if context_order == 2 else 95
+            )
+            return min(budget, selected_budget)
+        if "-contextnodes-" in policy:
+            return min(
+                budget,
+                47 if int(root_transition_context_order) <= 1 else 63,
+            )
+        if policy in PERSISTENT_OPTIMIZED_DEPTH_CONFIGS:
+            return min(
+                budget, PERSISTENT_OPTIMIZED_DEPTH_CONFIGS[policy][0]
+            )
         if policy == "context-score-prior-deeper-wide-plus2-node55":
             return min(budget, 55)
         if policy == "context-score-prior-deeper-wide-plus2-node47":
@@ -504,6 +630,66 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             if root_transition_top_probability >= 0.75:
                 return min(budget, 47)
         return budget
+
+    @staticmethod
+    def _score_priority_hit_masses(
+        policy: str,
+        root_transition_context_order: int,
+    ):
+        """Calibrate depth allocation while leaving candidate scores intact."""
+
+        if policy == (
+            "context-score-trigram-fusion-calibrated-"
+            "deepest-wide-plus4"
+        ):
+            return (0.70, 0.67, 0.59, 0.49, 0.38, 0.39)
+        if policy == "context-score-calibrated-deeper-wide-plus2":
+            return (0.66, 0.65, 0.62, 0.54, 0.38, 0.36)
+        if policy != (
+            "context-score-trigram-fusion-persistent-contextcal-"
+            "depth10-node63-wide-plus4"
+        ):
+            return None
+
+        context_order = int(root_transition_context_order)
+        if context_order >= 3:
+            return (
+                0.78,
+                0.76,
+                0.68,
+                0.62,
+                0.56,
+                0.50,
+                0.44,
+                0.38,
+                0.34,
+                0.30,
+            )
+        if context_order == 2:
+            return (
+                0.74,
+                0.72,
+                0.64,
+                0.57,
+                0.51,
+                0.45,
+                0.40,
+                0.35,
+                0.31,
+                0.28,
+            )
+        return (
+            0.68,
+            0.69,
+            0.60,
+            0.54,
+            0.48,
+            0.43,
+            0.38,
+            0.34,
+            0.30,
+            0.27,
+        )
 
     @staticmethod
     def _merge_persistent_transition_row(
@@ -773,6 +959,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         priority_layout: bool = False,
         score_priority_layout: bool = False,
         score_hit_masses=None,
+        copy_candidate_rows: bool = True,
+        fast_score_priority_layout: bool = False,
     ):
         # Node indices in the returned flat sequence start at one; zero is the
         # already-generated root token that has not yet entered the KV cache.
@@ -786,16 +974,39 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             previous_previous_previous_token=None,
         ):
             def normalized(candidate_row, score_row):
-                candidate_row = list(candidate_row[:level_width])
-                score_row = list(score_row[: len(candidate_row)])
-                if len(score_row) < len(candidate_row):
+                candidate_count = min(
+                    len(candidate_row), int(level_width)
+                )
+                selected_candidates = (
+                    list(candidate_row[:candidate_count])
+                    if copy_candidate_rows
+                    else (
+                        candidate_row
+                        if candidate_count == len(candidate_row)
+                        else candidate_row[:candidate_count]
+                    )
+                )
+                selected_scores = (
+                    list(score_row[:candidate_count])
+                    if copy_candidate_rows
+                    else (
+                        score_row
+                        if len(score_row) == candidate_count
+                        else score_row[:candidate_count]
+                    )
+                )
+                if len(selected_scores) < len(selected_candidates):
                     reciprocal = [
                         1.0 / rank
-                        for rank in range(1, len(candidate_row) + 1)
+                        for rank in range(
+                            1, len(selected_candidates) + 1
+                        )
                     ]
                     total = sum(reciprocal) or 1.0
-                    score_row = [value / total for value in reciprocal]
-                return candidate_row, score_row
+                    selected_scores = [
+                        value / total for value in reciprocal
+                    ]
+                return selected_candidates, selected_scores
 
             fourgram_key = (
                 (
@@ -1002,7 +1213,65 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             )
             return candidates
 
-        if score_priority_layout:
+        if score_priority_layout and fast_score_priority_layout:
+            if (
+                context_candidate_mode != "fusion"
+                or host_fourgram_transitions
+                or host_persistent_transitions
+                or host_global_candidates
+            ):
+                raise ValueError(
+                    "The C++ score-priority builder supports standard "
+                    "trigram fusion without auxiliary candidate sources"
+                )
+            from method.sam_grounded.fast_tree_builder import (
+                build_score_priority_nodes,
+            )
+
+            branch_width = width if branch_width is None else branch_width
+            resolved_hit_masses = score_hit_masses or (
+                0.68,
+                0.63,
+                0.50,
+                0.43,
+                0.40,
+                0.38,
+            )
+            node_rows = build_score_priority_nodes(
+                root_token=int(root_token),
+                root_previous_token=(
+                    int(root_previous_token)
+                    if root_previous_token is not None
+                    else -1
+                ),
+                root_previous_previous_token=(
+                    int(root_previous_previous_token)
+                    if root_previous_previous_token is not None
+                    else -1
+                ),
+                width=int(width),
+                branch_width=int(branch_width),
+                depth=int(depth),
+                node_budget=int(node_budget),
+                blocked_token_id=int(blocked_token_id),
+                unigram_rows=host_transitions or {},
+                unigram_scores=host_transition_scores or {},
+                context_rows=host_context_transitions or {},
+                context_scores=host_context_transition_scores or {},
+                trigram_rows=host_trigram_transitions or {},
+                trigram_scores=host_trigram_transition_scores or {},
+                hit_masses=list(resolved_hit_masses),
+            )
+            nodes = [
+                {
+                    "token": int(token),
+                    "parent": int(parent),
+                    "depth": int(node_depth),
+                    "rank": int(rank),
+                }
+                for token, parent, node_depth, rank in node_rows
+            ]
+        elif score_priority_layout:
             branch_width = width if branch_width is None else branch_width
             hit_masses = score_hit_masses or (
                 0.68,
@@ -1388,11 +1657,14 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         flat_tokens: List[int],
         paths: List[List[int]],
         remaining_tokens: int,
+        predictions: Optional[torch.Tensor] = None,
     ):
         # Transfer the small packed-tree prediction vector once.  Calling
         # ``Tensor.item`` for every path repeatedly synchronized the same root
         # and parent logits, which was measurable at decoding granularity.
-        predictions = torch.argmax(output_logits[0], dim=-1).tolist()
+        if predictions is None:
+            predictions = torch.argmax(output_logits[0], dim=-1)
+        predictions = predictions.tolist()
         best_path = []
         best_accept = 0
         for path in paths:
@@ -1645,6 +1917,12 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "hybrid",
         }
         grounding_free_policies.update(TRIGRAM_PLUS4_NODE_BUDGETS)
+        grounding_free_policies.update(PERSISTENT_FUSION_NODE_BUDGETS)
+        grounding_free_policies.update(PERSISTENT_COMMITTED_POLICIES)
+        grounding_free_policies.update(PERSISTENT_STABLE_NODE_BUDGETS)
+        grounding_free_policies.update(PERSISTENT_DEPTH_NODE_CONFIGS)
+        grounding_free_policies.update(PERSISTENT_ADAPTIVE_DEPTH_POLICIES)
+        grounding_free_policies.update(PERSISTENT_OPTIMIZED_DEPTH_CONFIGS)
         need_grounding = bool(
             cover_enabled or draft_policy not in grounding_free_policies
         )
@@ -1731,7 +2009,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "visual-wide-plus2-hst-backoff-gated",
             "grounded-residual",
             "grounded-residual-reverse",
-        ) or draft_policy in TRIGRAM_PLUS4_NODE_BUDGETS
+        ) or draft_policy in CONTEXT_PLUS4_SPECIAL_POLICIES
         context_width_augmentation = {
             "context-score-prior-deeper-wide-plus4": 4,
             "context-score-trigram-deeper-wide-plus4": 4,
@@ -1759,7 +2037,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "context-score-prior-deeper-wide-plus6": 6,
             "context-score-prior-deeper-wide-plus8": 8,
         }.get(draft_policy, 0)
-        if draft_policy in TRIGRAM_PLUS4_NODE_BUDGETS:
+        if draft_policy in CONTEXT_PLUS4_SPECIAL_POLICIES:
             context_width_augmentation = 4
         matrix_top_k = max(
             int(matrix_top_k),
@@ -1997,11 +2275,21 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         use_score_priority = draft_policy.startswith(
             ("score-prior-", "score-adaptive-", "context-score-")
         )
+        use_hotpath = "-hotpath-" in draft_policy
         use_persistent_ngram = bool(
             use_host_transitions and "-persistent-ngram-" in draft_policy
         )
         use_persistent_unigram = bool(
             use_host_transitions and "-persistent-" in draft_policy
+        )
+        use_persistent_shadow = bool(
+            use_host_transitions and "-shadow-" in draft_policy
+        )
+        use_committed_transitions_only = bool(
+            use_host_transitions and "-committed-" in draft_policy
+        )
+        skip_cached_prompt_transitions = bool(
+            use_host_transitions and "-stable-" in draft_policy
         )
         use_persistent_bank = bool(
             use_host_transitions and "-bank-" in draft_policy
@@ -2010,6 +2298,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         persistent_bank_scores = None
         persistent_bank_counts = None
         persistent_bank_pending = {}
+        persistent_shadow_transitions = None
+        persistent_shadow_scores = None
         if use_persistent_bank:
             persistent_banks = getattr(
                 self, "_gwtr_persistent_unigram_banks", None
@@ -2037,6 +2327,13 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             )
             host_transitions = persistent_cache["transitions"]
             host_transition_scores = persistent_cache["scores"]
+            if use_persistent_shadow:
+                persistent_shadow_transitions = persistent_cache.setdefault(
+                    "shadow_transitions", {}
+                )
+                persistent_shadow_scores = persistent_cache.setdefault(
+                    "shadow_scores", {}
+                )
         else:
             host_transitions = {} if use_host_transitions else None
             host_transition_scores = {} if use_score_priority else None
@@ -2139,9 +2436,20 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             topk = transition_logits.topk(matrix_top_k, dim=-1)
             topk_ids = topk.indices
             if host_transitions is not None:
+                queued_score_rows = (
+                    torch.softmax(topk.values.float(), dim=-1)
+                    if use_hotpath and host_transition_scores is not None
+                    else None
+                )
                 rows = topk_ids.tolist()
                 score_rows = (
-                    torch.softmax(topk.values.float(), dim=-1).tolist()
+                    (
+                        queued_score_rows.tolist()
+                        if queued_score_rows is not None
+                        else torch.softmax(
+                            topk.values.float(), dim=-1
+                        ).tolist()
+                    )
                     if host_transition_scores is not None
                     else None
                 )
@@ -2268,6 +2576,18 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                         normalized_scores = score_rows[row_index]
                     if update_unigram:
                         seen_tokens.add(token)
+                        if (
+                            persistent_shadow_transitions is not None
+                            and token in host_transitions
+                            and host_transitions[token] != converted_row
+                        ):
+                            persistent_shadow_transitions[token] = list(
+                                host_transitions[token]
+                            )
+                            if token in host_transition_scores:
+                                persistent_shadow_scores[token] = list(
+                                    host_transition_scores[token]
+                                )
                         host_transitions[token] = converted_row
                         if normalized_scores is not None:
                             host_transition_scores[token] = normalized_scores
@@ -2367,27 +2687,32 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         # from the much smaller verified generation trees instead.
         if host_transitions is not None:
             prompt_values = [int(token) for token in prompt_ids.tolist()]
-            seen_prompt_tokens = set()
-            unique_prompt_indices = []
-            unique_prompt_values = []
-            for prompt_index, token in enumerate(prompt_values):
-                if token in seen_prompt_tokens:
-                    continue
-                seen_prompt_tokens.add(token)
-                unique_prompt_indices.append(prompt_index)
-                unique_prompt_values.append(token)
-            prompt_row_indices = torch.tensor(
+            (
                 unique_prompt_indices,
-                dtype=torch.long,
-                device=prompt_ids.device,
+                unique_prompt_values,
+            ) = self._select_prompt_transition_rows(
+                prompt_values,
+                cached_tokens=(
+                    host_transitions
+                    if skip_cached_prompt_transitions
+                    else None
+                ),
             )
-            store_transitions(
-                init_output,
-                prompt_ids.index_select(0, prompt_row_indices),
-                token_values=unique_prompt_values,
-                output_row_indices=prompt_row_indices,
-            )
+            prompt_transition_row_count = len(unique_prompt_indices)
+            if unique_prompt_indices:
+                prompt_row_indices = torch.tensor(
+                    unique_prompt_indices,
+                    dtype=torch.long,
+                    device=prompt_ids.device,
+                )
+                store_transitions(
+                    init_output,
+                    prompt_ids.index_select(0, prompt_row_indices),
+                    token_values=unique_prompt_values,
+                    output_row_indices=prompt_row_indices,
+                )
         else:
+            prompt_transition_row_count = int(prompt_ids.numel())
             store_transitions(init_output, prompt_ids)
 
         init_token = torch.argmax(init_output.logits[:, -1, :], dim=-1)
@@ -2399,6 +2724,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         kwargs = {}
         acceptance_lengths = []
         trace = []
+        collect_policy_trace = bool(return_policy_trace)
         idx = -1
         topology_cache = getattr(
             self, "tree_recycling_topology_cache", None
@@ -2567,6 +2893,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 draft_policy,
                 tree_node_budget,
                 root_transition_top_probability,
+                root_transition_context_order,
             )
             effective_tree_depth = depth
             if global_backoff_active:
@@ -2805,8 +3132,11 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 host_fourgram_transition_scores=(
                     host_fourgram_transition_scores
                 ),
-                host_persistent_transitions=persistent_bank_transitions,
-                host_persistent_transition_scores=persistent_bank_scores,
+                host_persistent_transitions=(
+                    persistent_shadow_transitions
+                    if persistent_shadow_transitions is not None
+                    else persistent_bank_transitions
+                ),
                 host_global_candidates=(
                     global_candidate_ids if global_backoff_active else None
                 ),
@@ -2819,16 +3149,18 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 metadata_out=tree_metadata,
                 priority_layout=draft_policy.startswith("rank-prior-"),
                 score_priority_layout=use_score_priority,
-                score_hit_masses=(
-                    (0.70, 0.67, 0.59, 0.49, 0.38, 0.39)
-                    if draft_policy
-                    == "context-score-trigram-fusion-calibrated-deepest-wide-plus4"
-                    else (
-                        (0.66, 0.65, 0.62, 0.54, 0.38, 0.36)
-                        if draft_policy
-                        == "context-score-calibrated-deeper-wide-plus2"
-                        else None
-                    )
+                host_persistent_transition_scores=(
+                    persistent_shadow_scores
+                    if persistent_shadow_scores is not None
+                    else persistent_bank_scores
+                ),
+                score_hit_masses=self._score_priority_hit_masses(
+                    draft_policy,
+                    root_transition_context_order,
+                ),
+                copy_candidate_rows=not use_hotpath,
+                fast_score_priority_layout=(
+                    "-hotpath-cpp-" in draft_policy
                 ),
             )
             num_nodes = len(flat_tokens) - 1
@@ -2840,7 +3172,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             )
             max_path_depth = max((len(path) for path in paths), default=0)
             used_path_depth = min(max_path_depth, max(remaining - 1, 0))
-            record = {
+            record = ({
                 "iteration": len(trace),
                 **decision.to_dict(),
                 "requested_draft_policy": requested_draft_policy,
@@ -2882,8 +3214,31 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     else (
                         "latest-ngram"
                         if use_persistent_ngram
-                        else ("latest" if use_persistent_unigram else "none")
+                        else (
+                            "latest-committed"
+                            if use_committed_transitions_only
+                            else (
+                                "latest-shadow"
+                                if use_persistent_shadow
+                                else "none"
+                                if not use_persistent_unigram
+                                else "latest"
+                            )
+                        )
                     )
+                ),
+                "transition_update_scope": (
+                    "committed"
+                    if use_committed_transitions_only
+                    else "full-tree"
+                ),
+                "prompt_transition_refresh_mode": (
+                    "unseen-only"
+                    if skip_cached_prompt_transitions
+                    else "all-unique"
+                ),
+                "prompt_transition_row_count": int(
+                    prompt_transition_row_count
                 ),
                 "persistent_unigram_size_at_start": int(
                     persistent_unigram_size_at_start
@@ -2911,6 +3266,11 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 "persistent_trigram_size": int(
                     len(host_trigram_transitions)
                     if use_persistent_ngram
+                    else 0
+                ),
+                "persistent_shadow_size": int(
+                    len(persistent_shadow_transitions)
+                    if persistent_shadow_transitions is not None
                     else 0
                 ),
                 "root_transition_persistent": bool(
@@ -2987,8 +3347,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 "verification_boundary_recheck": False,
                 "verification_compact_path_repair": False,
                 "verification_compact_root_recheck": False,
-            }
-            if not trace and calibrator is not None:
+            } if collect_policy_trace else {})
+            if collect_policy_trace and not trace and calibrator is not None:
                 record["grounding_calibration"] = calibrator.diagnostics()
 
             if num_nodes == 0 or remaining <= 1:
@@ -3116,30 +3476,38 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     finally:
                         self.base_model.model.tree_mask = None
 
-                store_transitions(
-                    output,
-                    tree_input[0],
-                    token_values=flat_tokens,
-                    previous_token_values=(
-                        tree_metadata["semantic_previous_tokens"]
-                        if use_context_transitions
-                        else None
-                    ),
-                    previous_previous_token_values=(
-                        tree_metadata[
-                            "semantic_previous_previous_tokens"
-                        ]
-                        if use_trigram_transitions
-                        else None
-                    ),
-                    previous_previous_previous_token_values=(
-                        tree_metadata[
-                            "semantic_previous_previous_previous_tokens"
-                        ]
-                        if use_fourgram_transitions
-                        else None
-                    ),
+                queued_predictions = (
+                    torch.argmax(
+                        output.logits[0, : len(flat_tokens)], dim=-1
+                    )
+                    if use_hotpath
+                    else None
                 )
+                if not use_committed_transitions_only:
+                    store_transitions(
+                        output,
+                        tree_input[0],
+                        token_values=flat_tokens,
+                        previous_token_values=(
+                            tree_metadata["semantic_previous_tokens"]
+                            if use_context_transitions
+                            else None
+                        ),
+                        previous_previous_token_values=(
+                            tree_metadata[
+                                "semantic_previous_previous_tokens"
+                            ]
+                            if use_trigram_transitions
+                            else None
+                        ),
+                        previous_previous_previous_token_values=(
+                            tree_metadata[
+                                "semantic_previous_previous_previous_tokens"
+                            ]
+                            if use_fourgram_transitions
+                            else None
+                        ),
+                    )
                 if cover_probe_active:
                     actual_tree_length = int(tree_input.shape[1])
                     cover_view_logits = torch.cat(
@@ -3189,8 +3557,50 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     flat_tokens,
                     paths,
                     remaining,
+                    predictions=queued_predictions,
                 )
                 accept_len = len(accepted_path)
+                if use_committed_transitions_only:
+                    committed_rows = [0, *accepted_path]
+                    committed_row_indices = torch.tensor(
+                        committed_rows,
+                        dtype=torch.long,
+                        device=tree_input.device,
+                    )
+
+                    def committed_metadata_values(name):
+                        values = tree_metadata[name]
+                        return [values[index] for index in committed_rows]
+
+                    store_transitions(
+                        output,
+                        tree_input[0].index_select(
+                            0, committed_row_indices
+                        ),
+                        token_values=[flat_tokens[index] for index in committed_rows],
+                        previous_token_values=(
+                            committed_metadata_values(
+                                "semantic_previous_tokens"
+                            )
+                            if use_context_transitions
+                            else None
+                        ),
+                        previous_previous_token_values=(
+                            committed_metadata_values(
+                                "semantic_previous_previous_tokens"
+                            )
+                            if use_trigram_transitions
+                            else None
+                        ),
+                        previous_previous_previous_token_values=(
+                            committed_metadata_values(
+                                "semantic_previous_previous_previous_tokens"
+                            )
+                            if use_fourgram_transitions
+                            else None
+                        ),
+                        output_row_indices=committed_row_indices,
+                    )
                 compact_path_repair_applied = False
                 verification_committed_logits_override = None
                 if verification_compact_root_margin_threshold > 0.0:
@@ -3506,9 +3916,10 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             -2, kv_base_len, selected.shape[-2]
                         )
                         destination.copy_(selected, non_blocking=True)
-                record["cache_compaction_applied"] = bool(
-                    cache_compaction_applied
-                )
+                if collect_policy_trace:
+                    record["cache_compaction_applied"] = bool(
+                        cache_compaction_applied
+                    )
                 current_length_data.fill_(kv_base_len + len(accepted_path) + 1)
                 tokens_to_add = torch.tensor(
                     [accepted_tokens + [correction]],
@@ -3553,20 +3964,23 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             )
             controller.observe(accept_len, used_path_depth)
             acceptance_lengths.append(int(accept_len))
-            record.update(
-                {
-                    "accept_len": int(accept_len),
-                    "accept_ratio": (
-                        float(accept_len) / used_path_depth
-                        if used_path_depth > 0
-                        else 0.0
-                    ),
-                    "next_grounding_score": float(grounding_score),
-                    "next_confidence": float(confidence),
-                    "acceptance_ema_after": float(controller.acceptance_ema),
-                }
-            )
-            trace.append(record)
+            if collect_policy_trace:
+                record.update(
+                    {
+                        "accept_len": int(accept_len),
+                        "accept_ratio": (
+                            float(accept_len) / used_path_depth
+                            if used_path_depth > 0
+                            else 0.0
+                        ),
+                        "next_grounding_score": float(grounding_score),
+                        "next_confidence": float(confidence),
+                        "acceptance_ema_after": float(
+                            controller.acceptance_ema
+                        ),
+                    }
+                )
+                trace.append(record)
 
         if persistent_bank_transitions is not None:
             for token, (new_row, new_scores) in persistent_bank_pending.items():

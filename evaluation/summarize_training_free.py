@@ -85,7 +85,18 @@ def summarize(jsonl_path, reference_path=None):
     ]
     total_tokens = sum(turn["new_tokens"] for turn in turns)
     total_time = sum(turn["wall_time"] for turn in turns)
-    total_iterations = sum(max(len(turn["trace"]) + 1, 1) for turn in turns)
+    total_iterations = sum(
+        max(
+            (
+                len(turn["trace"])
+                if turn["trace"]
+                else len(turn["acceptance"])
+            )
+            + 1,
+            1,
+        )
+        for turn in turns
+    )
     turn_speeds = [
         turn["new_tokens"] / turn["wall_time"]
         for turn in turns

@@ -75,6 +75,125 @@ def test_trigram_node_budget_policies_parse_and_cap_verifier_batch():
         ) == 15
 
 
+def test_persistent_fusion_node_budget_policies_parse_and_cap_verifier_batch():
+    policies = [
+        f"context-score-trigram-fusion-persistent-node{budget}-deepest-wide-plus4"
+        for budget in (39, 47, 55, 63, 79, 95)
+    ]
+    assert _parse_policies(",".join(policies)) == policies
+    for policy, expected in zip(policies, (39, 47, 55, 63, 79, 95)):
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 95, None
+        ) == expected
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 31, 0.99
+        ) == 31
+
+
+def test_persistent_committed_policy_parses_and_keeps_full_budget():
+    policy = (
+        "context-score-trigram-fusion-persistent-committed-"
+        "deepest-wide-plus4"
+    )
+    assert _parse_policies(policy) == [policy]
+    assert TreeRecyclingSpecModel._effective_tree_node_budget(
+        policy, 63, 0.99
+    ) == 63
+
+
+def test_persistent_stable_policies_parse_and_cap_verifier_batch():
+    policies = [
+        f"context-score-trigram-fusion-persistent-stable-node{budget}-deepest-wide-plus4"
+        for budget in (55, 63)
+    ]
+    assert _parse_policies(",".join(policies)) == policies
+    for policy, expected in zip(policies, (55, 63)):
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 95, None
+        ) == expected
+
+
+def test_persistent_depth_policies_parse_and_cap_configured_budget():
+    configs = (
+        (7, 63),
+        (8, 55),
+        (8, 63),
+        (10, 47),
+        (10, 55),
+        (10, 63),
+        (10, 79),
+        (10, 95),
+    )
+    policies = [
+        f"context-score-trigram-fusion-persistent-depth{depth}-node{budget}-wide-plus4"
+        for depth, budget in configs
+    ]
+    assert _parse_policies(",".join(policies)) == policies
+    for policy, (_, expected_budget) in zip(policies, configs):
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 95, None
+        ) == expected_budget
+
+
+def test_persistent_adaptive95_policy_expands_only_mid_confidence_roots():
+    policy = (
+        "context-score-trigram-fusion-persistent-adaptive95-"
+        "depth10-wide-plus4"
+    )
+    assert _parse_policies(policy) == [policy]
+    choose = TreeRecyclingSpecModel._effective_tree_node_budget
+    assert choose(policy, 95, None) == 63
+    assert choose(policy, 95, 0.39) == 63
+    assert choose(policy, 95, 0.40) == 95
+    assert choose(policy, 95, 0.69) == 95
+    assert choose(policy, 95, 0.70) == 63
+
+
+def test_persistent_optimized_depth_policies_parse_and_use_node63_depth10():
+    policies = [
+        "context-score-trigram-fusion-persistent-contextcal-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-shadow-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-hotpath-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
+        "depth10-node95-wide-plus4",
+    ]
+    assert _parse_policies(",".join(policies)) == policies
+    for policy in policies[:2]:
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 95, None
+        ) == 63
+    choose_budget = TreeRecyclingSpecModel._effective_tree_node_budget
+    assert choose_budget(policies[2], 95, 0.5, 1) == 47
+    assert choose_budget(policies[2], 95, 0.5, 2) == 63
+    assert choose_budget(policies[3], 95, 0.5, 1) == 47
+    assert choose_budget(policies[3], 95, 0.5, 3) == 63
+    assert choose_budget(policies[4], 95, 0.5, 1) == 47
+    assert choose_budget(policies[4], 95, 0.5, 2) == 63
+    assert choose_budget(policies[4], 95, 0.5, 3) == 63
+    assert choose_budget(policies[5], 95, 0.5, 1) == 47
+    assert choose_budget(policies[5], 95, 0.5, 2) == 63
+    assert choose_budget(policies[5], 95, 0.5, 3) == 95
+
+    choose_masses = TreeRecyclingSpecModel._score_priority_hit_masses
+    assert choose_masses(policies[0], 3)[:3] == (0.78, 0.76, 0.68)
+    assert choose_masses(policies[0], 2)[:3] == (0.74, 0.72, 0.64)
+    assert choose_masses(policies[0], 1)[:3] == (0.68, 0.69, 0.60)
+    assert choose_masses(policies[1], 3) is None
+
+
+def test_prompt_transition_row_selection_can_skip_persistent_hits():
+    choose = TreeRecyclingSpecModel._select_prompt_transition_rows
+    assert choose([7, 8, 7, 9]) == ([0, 1, 3], [7, 8, 9])
+    assert choose([7, 8, 7, 9], cached_tokens={8, 9}) == ([0], [7])
+
+
 def test_existing_adaptive_node_budgets_keep_their_thresholds():
     choose = TreeRecyclingSpecModel._effective_tree_node_budget
     assert choose("context-score-adaptive-safe-deeper-wide-plus2", 63, None) == 63
@@ -365,10 +484,54 @@ def test_tree_shape_uses_configured_visual_thresholds():
         "context-score-trigram-fusion-persistent-global15-deepest-wide-plus4",
         "context-score-trigram-fusion-persistent-ngram-deepest-wide-plus4",
         "context-score-trigram-fusion-persistent-ngram-global15-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-committed-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-stable-node55-deepest-wide-plus4",
+        "context-score-trigram-fusion-persistent-stable-node63-deepest-wide-plus4",
         "context-score-trigram-fusion-bank-deepest-wide-plus4",
         "context-score-trigram-fusion-bank-global15-deepest-wide-plus4",
     ):
         assert TreeRecyclingSpecModel._tree_shape(policy, *common) == (8, 5)
+    for budget in (39, 47, 55, 63, 79, 95):
+        assert TreeRecyclingSpecModel._tree_shape(
+            f"context-score-trigram-fusion-persistent-node{budget}-deepest-wide-plus4",
+            *common,
+        ) == (8, 5)
+    for depth, budget in (
+        (7, 63),
+        (8, 55),
+        (8, 63),
+        (10, 47),
+        (10, 55),
+        (10, 63),
+        (10, 79),
+        (10, 95),
+    ):
+        assert TreeRecyclingSpecModel._tree_shape(
+            f"context-score-trigram-fusion-persistent-depth{depth}-node{budget}-wide-plus4",
+            *common,
+        ) == (8, depth)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-fusion-persistent-adaptive95-"
+        "depth10-wide-plus4",
+        *common,
+    ) == (8, 10)
+    for policy in (
+        "context-score-trigram-fusion-persistent-contextcal-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-shadow-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-hotpath-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
+        "depth10-node95-wide-plus4",
+    ):
+        assert TreeRecyclingSpecModel._tree_shape(
+            policy, *common
+        ) == (8, 10)
     assert TreeRecyclingSpecModel._tree_shape(
         "context-score-trigram-fusion-global7-deepest-wide-plus4", *common
     ) == (8, 5)
@@ -872,6 +1035,23 @@ def test_persistent_candidates_are_a_lower_order_fallback():
     )
     assert tokens == [0, 1, 2]
 
+    tokens, _, _, _ = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=4,
+        depth=1,
+        node_budget=4,
+        blocked_token_id=None,
+        host_transitions={0: [1, 2]},
+        host_transition_scores={0: [0.7, 0.3]},
+        host_persistent_transitions={0: [5, 6]},
+        host_persistent_transition_scores={0: [0.7, 0.3]},
+        context_candidate_mode="fusion",
+        score_priority_layout=True,
+    )
+    assert tokens == [0, 1, 2, 5, 6]
+
 
 def test_best_verified_path_uses_longest_matching_branch():
     # Root predicts token 11.  Its packed node then predicts token 13, so the
@@ -894,7 +1074,14 @@ def test_best_verified_path_uses_longest_matching_branch():
     assert accepted_tokens == [11, 13]
     assert correction == 15
     assert query_index == 3
-
+    queued = torch.argmax(logits[0], dim=-1)
+    assert TreeRecyclingSpecModel._best_verified_path(
+        logits,
+        flat_tokens=[7, 11, 12, 13],
+        paths=[[1], [2], [1, 3]],
+        remaining_tokens=8,
+        predictions=queued,
+    ) == (accepted_path, accepted_tokens, correction, query_index)
 
 def test_cache_compaction_is_skipped_for_already_contiguous_paths():
     requires = TreeRecyclingSpecModel._requires_cache_compaction

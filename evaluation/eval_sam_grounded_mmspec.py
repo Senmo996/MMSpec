@@ -238,6 +238,7 @@ def evaluate(args):
         "qshape_exact_root_attention_layers="
         f"{qshape_exact_root_attention_layers}"
     )
+    print(f"policy_trace_enabled={not args.no_policy_trace}")
 
     if args.sanity:
         run_sanity_check(args, model, tokenizer, data)
@@ -320,14 +321,18 @@ def evaluate(args):
                         max_new_tokens=args.max_new_token,
                         log=True,
                         return_acceptance_len=True,
-                        return_policy_trace=True,
+                        return_policy_trace=not args.no_policy_trace,
                         **_policy_kwargs(args, policy),
                     )
                     torch.cuda.synchronize()
                     elapsed = time.perf_counter() - started
                     draft_time, target_time = tracker.snapshot()
 
-                    output_ids, n_new, idx, accepted, trace = result
+                    if args.no_policy_trace:
+                        output_ids, n_new, idx, accepted = result
+                        trace = []
+                    else:
+                        output_ids, n_new, idx, accepted, trace = result
                     output_hashes.append(_token_hash(output_ids, input_len))
                     if args.save_token_ids:
                         output_token_ids.append(
@@ -352,7 +357,8 @@ def evaluate(args):
                     new_tokens.append(int(n_new))
                     wall_times.append(float(elapsed))
                     acceptance_lengths.append(accepted)
-                    policy_traces.append(trace)
+                    if not args.no_policy_trace:
+                        policy_traces.append(trace)
                     draft_times.append(float(draft_time))
                     target_times.append(float(target_time))
 
@@ -363,10 +369,11 @@ def evaluate(args):
                     "new_tokens": new_tokens,
                     "wall_time": wall_times,
                     "acceptance_length": acceptance_lengths,
-                    "policy_trace": policy_traces,
                     "draft_time": draft_times,
                     "target_time": target_times,
                 }
+                if not args.no_policy_trace:
+                    choice["policy_trace"] = policy_traces
                 if args.save_decoded_output:
                     choice["turns"] = decoded_turns
                 if args.save_token_ids:
@@ -538,6 +545,14 @@ def main():
     parser.add_argument("--save-decoded-output", action="store_true")
     parser.add_argument("--save-token-ids", action="store_true")
     parser.add_argument(
+        "--no-policy-trace",
+        action="store_true",
+        help=(
+            "Disable per-iteration policy-trace construction and storage for "
+            "compact, production-like latency evaluation."
+        ),
+    )
+    parser.add_argument(
         "--enable-repeat-guard",
         action="store_true",
         help="Enable SAM's non-standard repeated-ngram early-stop heuristic.",
@@ -606,6 +621,15 @@ def main():
         parser.error(
             "--verification-compact-path-repair cannot be combined with "
             "positive --verification-margin-threshold"
+        )
+    if args.no_policy_trace and (
+        args.hst_trace_diagnostics
+        or args.verification_trace_diagnostics
+        or args.verification_layer_diagnostics
+    ):
+        parser.error(
+            "trace diagnostics require policy traces; remove "
+            "--no-policy-trace"
         )
     args.model = args.base_model_path
     evaluate(args)
