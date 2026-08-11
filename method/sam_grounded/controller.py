@@ -66,6 +66,18 @@ PERSISTENT_OPTIMIZED_DEPTH_POLICIES = frozenset(
         "depth10-node63-wide-plus4",
         "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
         "depth10-node95-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node79-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node95-wide-plus4",
+        "context-score-trigram-fusion-persistent-empirical-hotpath-cpp-"
+        "depth14-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-suffix4-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-suffix4-visualcache-"
+        "hotpath-cpp-depth10-node63-wide-plus4",
     }
 )
 

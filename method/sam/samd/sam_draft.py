@@ -55,11 +55,17 @@ class DraftModel(torch.nn.Module):
         self.sam_static.reset()
 
     def lookup(self, start_token: int):
+        seq, buffers_kwargs = self.lookup_tokens(start_token)
+        draft = torch.tensor(seq, device=self.device).long()
+        return (CandidateType.sequence, draft, buffers_kwargs)
+
+    def lookup_tokens(self, start_token: int):
+        """Return a host token list without an unnecessary device transfer."""
+
         index_dyn, match_dyn = self.sam_dyn.lookup(start_token)
         # index_static, match_static = self.sam_static.lookup(start_token)
         seq, buffers_kwargs = self.sam_dyn.gen_dyn_draft(index_dyn, match_dyn, start_token)
-        draft = torch.tensor(seq[1:], device=self.device).long()
-        return (CandidateType.sequence, draft, buffers_kwargs)
+        return seq[1:], buffers_kwargs
         # if match_dyn >= match_static:
         #     seq, buffers_kwargs = self.sam_dyn.gen_dyn_draft(index_dyn, match_dyn, start_token)
         #     return (CandidateType.sequence, seq, buffers_kwargs)
@@ -70,6 +76,11 @@ class DraftModel(torch.nn.Module):
     def update(self,
         tokens: Optional[torch.Tensor] = None,
     ):
-        tokens_list = tokens.tolist()
+        self.update_tokens(tokens.tolist())
+
+    def update_tokens(self, tokens):
+        """Update both SAM indexes from an existing host sequence."""
+
+        tokens_list = [int(token) for token in tokens]
         self.sam_dyn.add_tokens(tokens_list)
         self.sam_static.transfer_tokens(tokens_list)

@@ -322,6 +322,19 @@ def evaluate(args):
                         log=True,
                         return_acceptance_len=True,
                         return_policy_trace=not args.no_policy_trace,
+                        **(
+                            {
+                                "visual_cache_key": (
+                                    policy,
+                                    str(sample["id"]),
+                                    choice_index,
+                                )
+                                if "-visualcache-" in policy
+                                else None
+                            }
+                            if args.draft_engine == "tree-recycling"
+                            else {}
+                        ),
                         **_policy_kwargs(args, policy),
                     )
                     torch.cuda.synchronize()

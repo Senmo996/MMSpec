@@ -84,6 +84,18 @@ PERSISTENT_OPTIMIZED_DEPTH_CONFIGS = {
     "depth10-node63-wide-plus4": (63, 10),
     "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
     "depth10-node95-wide-plus4": (95, 10),
+    "context-score-trigram-fusion-persistent-hotpath-cpp-"
+    "depth10-node63-wide-plus4": (63, 10),
+    "context-score-trigram-fusion-persistent-hotpath-cpp-"
+    "depth10-node79-wide-plus4": (79, 10),
+    "context-score-trigram-fusion-persistent-hotpath-cpp-"
+    "depth10-node95-wide-plus4": (95, 10),
+    "context-score-trigram-fusion-persistent-empirical-hotpath-cpp-"
+    "depth14-node63-wide-plus4": (63, 14),
+    "context-score-trigram-fusion-persistent-suffix4-hotpath-cpp-"
+    "depth10-node63-wide-plus4": (63, 10),
+    "context-score-trigram-fusion-persistent-suffix4-visualcache-"
+    "hotpath-cpp-depth10-node63-wide-plus4": (63, 10),
 }
 
 CONTEXT_PLUS4_SPECIAL_POLICIES = frozenset(
@@ -132,6 +144,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         persistent_banks = getattr(self, "_gwtr_persistent_unigram_banks", None)
         if persistent_banks is not None:
             persistent_banks.clear()
+        self._gwtr_visual_feature_cache = None
 
     @staticmethod
     def _select_prompt_transition_rows(
@@ -645,15 +658,20 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             return (0.70, 0.67, 0.59, 0.49, 0.38, 0.39)
         if policy == "context-score-calibrated-deeper-wide-plus2":
             return (0.66, 0.65, 0.62, 0.54, 0.38, 0.36)
-        if policy != (
+        context_calibrated = policy == (
             "context-score-trigram-fusion-persistent-contextcal-"
             "depth10-node63-wide-plus4"
-        ):
+        )
+        empirical_deep = policy == (
+            "context-score-trigram-fusion-persistent-empirical-hotpath-cpp-"
+            "depth14-node63-wide-plus4"
+        )
+        if not context_calibrated and not empirical_deep:
             return None
 
         context_order = int(root_transition_context_order)
         if context_order >= 3:
-            return (
+            masses = (
                 0.78,
                 0.76,
                 0.68,
@@ -665,8 +683,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 0.34,
                 0.30,
             )
-        if context_order == 2:
-            return (
+        elif context_order == 2:
+            masses = (
                 0.74,
                 0.72,
                 0.64,
@@ -678,18 +696,22 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 0.31,
                 0.28,
             )
-        return (
-            0.68,
-            0.69,
-            0.60,
-            0.54,
-            0.48,
-            0.43,
-            0.38,
-            0.34,
-            0.30,
-            0.27,
-        )
+        else:
+            masses = (
+                0.68,
+                0.69,
+                0.60,
+                0.54,
+                0.48,
+                0.43,
+                0.38,
+                0.34,
+                0.30,
+                0.27,
+            )
+        if empirical_deep:
+            return (*masses, 0.25, 0.23, 0.21, 0.19)
+        return masses
 
     @staticmethod
     def _merge_persistent_transition_row(
@@ -961,6 +983,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         score_hit_masses=None,
         copy_candidate_rows: bool = True,
         fast_score_priority_layout: bool = False,
+        reserved_path_tokens=None,
     ):
         # Node indices in the returned flat sequence start at one; zero is the
         # already-generated root token that has not yet entered the KV cache.
@@ -1554,6 +1577,48 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 if not frontier or len(nodes) >= node_budget:
                     break
 
+        if reserved_path_tokens:
+            # A suffix-automaton match is a single high-value path rather than
+            # another independent transition distribution.  Reuse any prefix
+            # already selected by the score-priority tree and append only the
+            # missing suffix nodes.  At most a handful of rows are added, so
+            # the path improves coverage without displacing globally ranked
+            # recycling candidates.
+            children = {
+                (int(node["parent"]), int(node["token"])): flat_index
+                for flat_index, node in enumerate(nodes, start=1)
+            }
+            parent_index = 0
+            parent_token = int(root_token)
+            parent_depth = 0
+            path_edges = set()
+            for raw_token in reserved_path_tokens:
+                token = int(raw_token)
+                edge = (parent_token, token)
+                node_depth = parent_depth + 1
+                if (
+                    token == blocked_token_id
+                    or edge in path_edges
+                    or node_depth > int(depth)
+                ):
+                    break
+                child_index = children.get((parent_index, token))
+                if child_index is None:
+                    child_index = len(nodes) + 1
+                    nodes.append(
+                        {
+                            "token": token,
+                            "parent": parent_index,
+                            "depth": node_depth,
+                            "rank": 0,
+                        }
+                    )
+                    children[(parent_index, token)] = child_index
+                path_edges.add(edge)
+                parent_index = child_index
+                parent_token = token
+                parent_depth = node_depth
+
         topology_key = (
             transitions.device.type,
             transitions.device.index,
@@ -1768,6 +1833,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         verification_margin_threshold=0.0,
         verification_compact_path_repair=False,
         verification_compact_root_margin_threshold=0.0,
+        visual_cache_key=None,
         return_policy_trace=False,
         disable_repeat_guard=True,
         **kwargs,
@@ -2084,10 +2150,28 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         if inputs_embeds is None:
             inputs_embeds = self.base_model.model.embed_tokens(input_ids)
             if pixel_values is not None:
-                image_embeds = self.base_model.visual(
-                    pixel_values.type(self.base_model.visual.dtype),
-                    grid_thw=image_grid_thw,
+                cached_visual = getattr(
+                    self, "_gwtr_visual_feature_cache", None
                 )
+                if (
+                    visual_cache_key is not None
+                    and cached_visual is not None
+                    and cached_visual[0] == visual_cache_key
+                ):
+                    image_embeds = cached_visual[1]
+                else:
+                    image_embeds = self.base_model.visual(
+                        pixel_values.type(self.base_model.visual.dtype),
+                        grid_thw=image_grid_thw,
+                    )
+                    if visual_cache_key is not None:
+                        # Only the immediately active multi-turn request needs
+                        # reuse.  A single-entry cache bounds memory and avoids
+                        # leaking features across samples or policies.
+                        self._gwtr_visual_feature_cache = (
+                            visual_cache_key,
+                            image_embeds.detach(),
+                        )
                 image_mask = input_ids.eq(image_token_id)
                 if int(image_mask.sum().item()) != int(image_embeds.shape[0]):
                     raise ValueError("Image features and image tokens do not match")
@@ -2276,6 +2360,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             ("score-prior-", "score-adaptive-", "context-score-")
         )
         use_hotpath = "-hotpath-" in draft_policy
+        use_suffix_reserve = "-suffix4-" in draft_policy
         use_persistent_ngram = bool(
             use_host_transitions and "-persistent-ngram-" in draft_policy
         )
@@ -2717,9 +2802,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
 
         init_token = torch.argmax(init_output.logits[:, -1, :], dim=-1)
         input_ids = torch.cat([input_ids, init_token[:, None]], dim=1)
-        if use_suffix_hybrid:
+        if use_suffix_hybrid or use_suffix_reserve:
             self.draft.reset()
-            self.draft.update(input_ids[0].detach().cpu())
+            self.draft.update_tokens(input_ids[0].tolist())
         current_length_data.fill_(input_ids.shape[1] - 1)
         kwargs = {}
         acceptance_lengths = []
@@ -3040,7 +3125,12 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 )
             sam_draft_tokens = []
             use_sam_spine = False
-            if use_suffix_hybrid:
+            if use_suffix_reserve:
+                sam_draft_tokens, _ = self.draft.lookup_tokens(root_token)
+                sam_draft_tokens = [
+                    int(token) for token in sam_draft_tokens[:4]
+                ]
+            elif use_suffix_hybrid:
                 _, sam_draft, _ = self.draft.lookup(root_token)
                 sam_draft_tokens = [
                     int(token)
@@ -3161,6 +3251,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 copy_candidate_rows=not use_hotpath,
                 fast_score_priority_layout=(
                     "-hotpath-cpp-" in draft_policy
+                ),
+                reserved_path_tokens=(
+                    sam_draft_tokens if use_suffix_reserve else None
                 ),
             )
             num_nodes = len(flat_tokens) - 1
@@ -3402,8 +3495,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             "verification_accepted_path": [],
                         }
                     )
-                if use_suffix_hybrid:
-                    self.draft.update(next_id)
+                if use_suffix_hybrid or use_suffix_reserve:
+                    self.draft.update_tokens(next_id.tolist())
                 current_length_data.fill_(input_ids.shape[1] - 1)
                 accepted_path = []
                 accept_len = 0
@@ -3927,8 +4020,10 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     device=input_ids.device,
                 )[:, :remaining]
                 input_ids = torch.cat([input_ids, tokens_to_add], dim=1)
-                if use_suffix_hybrid:
-                    self.draft.update(tokens_to_add[0])
+                if use_suffix_hybrid or use_suffix_reserve:
+                    self.draft.update_tokens(
+                        (accepted_tokens + [correction])[:remaining]
+                    )
 
             if hst_bank is not None:
                 output_hidden = self._layer_hidden(output, -1)[0]

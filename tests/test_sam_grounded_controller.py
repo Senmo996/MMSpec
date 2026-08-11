@@ -163,6 +163,18 @@ def test_persistent_optimized_depth_policies_parse_and_use_node63_depth10():
         "depth10-node63-wide-plus4",
         "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
         "depth10-node95-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node79-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node95-wide-plus4",
+        "context-score-trigram-fusion-persistent-empirical-hotpath-cpp-"
+        "depth14-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-suffix4-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-suffix4-visualcache-"
+        "hotpath-cpp-depth10-node63-wide-plus4",
     ]
     assert _parse_policies(",".join(policies)) == policies
     for policy in policies[:2]:
@@ -180,12 +192,19 @@ def test_persistent_optimized_depth_policies_parse_and_use_node63_depth10():
     assert choose_budget(policies[5], 95, 0.5, 1) == 47
     assert choose_budget(policies[5], 95, 0.5, 2) == 63
     assert choose_budget(policies[5], 95, 0.5, 3) == 95
+    assert choose_budget(policies[6], 95, 0.5, 1) == 63
+    assert choose_budget(policies[7], 95, 0.5, 1) == 79
+    assert choose_budget(policies[8], 95, 0.5, 1) == 95
+    assert choose_budget(policies[9], 95, 0.5, 1) == 63
+    assert choose_budget(policies[10], 95, 0.5, 1) == 63
+    assert choose_budget(policies[11], 95, 0.5, 1) == 63
 
     choose_masses = TreeRecyclingSpecModel._score_priority_hit_masses
     assert choose_masses(policies[0], 3)[:3] == (0.78, 0.76, 0.68)
     assert choose_masses(policies[0], 2)[:3] == (0.74, 0.72, 0.64)
     assert choose_masses(policies[0], 1)[:3] == (0.68, 0.69, 0.60)
     assert choose_masses(policies[1], 3) is None
+    assert len(choose_masses(policies[9], 3)) == 14
 
 
 def test_prompt_transition_row_selection_can_skip_persistent_hits():
@@ -528,10 +547,25 @@ def test_tree_shape_uses_configured_visual_thresholds():
         "depth10-node63-wide-plus4",
         "context-score-trigram-fusion-persistent-contextnodes95-hotpath-cpp-"
         "depth10-node95-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node79-wide-plus4",
+        "context-score-trigram-fusion-persistent-hotpath-cpp-"
+        "depth10-node95-wide-plus4",
+        "context-score-trigram-fusion-persistent-suffix4-hotpath-cpp-"
+        "depth10-node63-wide-plus4",
+        "context-score-trigram-fusion-persistent-suffix4-visualcache-"
+        "hotpath-cpp-depth10-node63-wide-plus4",
     ):
         assert TreeRecyclingSpecModel._tree_shape(
             policy, *common
         ) == (8, 10)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-fusion-persistent-empirical-hotpath-cpp-"
+        "depth14-node63-wide-plus4",
+        *common,
+    ) == (8, 14)
     assert TreeRecyclingSpecModel._tree_shape(
         "context-score-trigram-fusion-global7-deepest-wide-plus4", *common
     ) == (8, 5)
@@ -614,6 +648,25 @@ def test_tree_shape_uses_configured_visual_thresholds():
     assert TreeRecyclingSpecModel._tree_shape("grounded-hybrid-reverse", *common) == (2, 4)
     assert TreeRecyclingSpecModel._tree_shape("visual-width", *common) == (4, 2)
     assert TreeRecyclingSpecModel._tree_shape("visual-width-reverse", *common) == (2, 2)
+
+
+def test_reserved_suffix_path_reuses_existing_prefix_and_appends_tail():
+    tokens, _, positions, paths = TreeRecyclingSpecModel._build_tree(
+        root_token=7,
+        transitions=torch.empty(0, dtype=torch.long),
+        transition_valid=torch.empty(0, dtype=torch.bool),
+        width=4,
+        depth=4,
+        node_budget=4,
+        blocked_token_id=99,
+        host_transitions={7: [8]},
+        host_transition_scores={7: [1.0]},
+        score_priority_layout=True,
+        reserved_path_tokens=[8, 9, 10],
+    )
+    assert tokens == [7, 8, 9, 10]
+    assert positions.tolist() == [0, 1, 2, 3]
+    assert paths == [[1], [1, 2], [1, 2, 3]]
 
 
 def test_visual_rootwide_policy_narrows_only_grounded_child_branches():
