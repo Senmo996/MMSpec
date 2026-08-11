@@ -237,6 +237,72 @@ def test_tree_shape_uses_configured_visual_thresholds():
         "visual-rootwide-plus2-hst-backoff", *common
     ) == (6, 2)
     assert TreeRecyclingSpecModel._tree_shape("wide-plus2", *common) == (6, 2)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "rank-prior-wide-plus2", *common
+    ) == (6, 2)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "rank-prior-deep-wide-plus2", *common
+    ) == (6, 3)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "rank-prior-deeper-wide-plus2", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "rank-prior-deepest-wide-plus2", *common
+    ) == (6, 5)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "score-prior-deep-wide-plus2", *common
+    ) == (6, 3)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "score-prior-deeper-wide-plus2", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-prior-deeper-wide-plus2", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-prior-deeper-wide-plus4", *common
+    ) == (8, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-deeper-wide-plus4", *common
+    ) == (8, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-deeper-wide-plus6", *common
+    ) == (10, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-trigram-deeper-wide-plus8", *common
+    ) == (12, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-prior-deeper-wide-plus5", *common
+    ) == (9, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-prior-deeper-wide-plus6", *common
+    ) == (10, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-prior-deeper-wide-plus8", *common
+    ) == (12, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-calibrated-deeper-wide-plus2", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-prior-deeper-wide-plus2-node55", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-prior-deeper-wide-plus2-node47", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "context-score-adaptive-safe-deeper-wide-plus2", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "score-prior-deepest-wide-plus2", *common
+    ) == (6, 5)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "score-prior-maxdeep-wide-plus2", *common
+    ) == (6, 9)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "score-adaptive-safe-deeper-wide-plus2", *common
+    ) == (6, 4)
+    assert TreeRecyclingSpecModel._tree_shape(
+        "score-adaptive-deeper-wide-plus2", *common
+    ) == (6, 4)
     assert TreeRecyclingSpecModel._tree_shape("visual-wide-plus2", *common) == (6, 2)
     assert TreeRecyclingSpecModel._tree_shape(
         "visual-wide-plus2-vli-backoff", *common
@@ -271,6 +337,15 @@ def test_visual_rootwide_policy_narrows_only_grounded_child_branches():
     ) == 2
     assert branch_width("visual-rootwide-plus2", 0.4, 0.55, 4, 2) == 4
     assert branch_width("visual-wide-plus2", 0.8, 0.55, 6, 2) == 6
+    assert branch_width(
+        "context-score-prior-deeper-wide-plus6", 0.0, 0.55, 10, 2
+    ) == 8
+    assert branch_width(
+        "context-score-prior-deeper-wide-plus5", 0.0, 0.55, 9, 2
+    ) == 8
+    assert branch_width(
+        "context-score-prior-deeper-wide-plus8", 0.0, 0.55, 12, 2
+    ) == 6
 
 
 def test_tree_builder_preserves_branches_and_blocks_edge_cycles():
@@ -295,6 +370,207 @@ def test_tree_builder_preserves_branches_and_blocks_edge_cycles():
     assert mask.shape == (1, 1, len(tokens), len(tokens))
     assert int(positions.max().item()) == 3
     assert any(len(path) == 3 for path in paths)
+
+
+def test_tree_builder_reuses_cached_topology_tensors():
+    transitions = torch.zeros((1, 8, 2), dtype=torch.long)
+    valid = torch.zeros((1, 8), dtype=torch.bool)
+    transitions[0, 1] = torch.tensor([2, 3])
+    transitions[0, 2] = torch.tensor([4, 5])
+    transitions[0, 3] = torch.tensor([6, 7])
+    valid[0, 1:8] = True
+    cache = {}
+
+    first = TreeRecyclingSpecModel._build_tree(
+        root_token=1,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=2,
+        node_budget=6,
+        blocked_token_id=None,
+        topology_cache=cache,
+    )
+    second = TreeRecyclingSpecModel._build_tree(
+        root_token=1,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=2,
+        node_budget=6,
+        blocked_token_id=None,
+        topology_cache=cache,
+    )
+
+    assert len(cache) == 1
+    assert first[1].data_ptr() == second[1].data_ptr()
+    assert first[2].data_ptr() == second[2].data_ptr()
+    assert first[3] is second[3]
+
+
+def test_tree_builder_accepts_equivalent_host_transition_rows():
+    transitions = torch.zeros((1, 8, 2), dtype=torch.long)
+    valid = torch.zeros((1, 8), dtype=torch.bool)
+    transitions[0, 1] = torch.tensor([2, 3])
+    transitions[0, 2] = torch.tensor([4, 5])
+    transitions[0, 3] = torch.tensor([6, 7])
+    valid[0, 1:8] = True
+    host = {1: [2, 3], 2: [4, 5], 3: [6, 7]}
+
+    device_tree = TreeRecyclingSpecModel._build_tree(
+        root_token=1,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=2,
+        node_budget=6,
+        blocked_token_id=None,
+    )
+    host_tree = TreeRecyclingSpecModel._build_tree(
+        root_token=1,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=2,
+        node_budget=6,
+        blocked_token_id=None,
+        host_transitions=host,
+    )
+
+    assert host_tree[0] == device_tree[0]
+    assert torch.equal(host_tree[1], device_tree[1])
+    assert torch.equal(host_tree[2], device_tree[2])
+    assert host_tree[3] == device_tree[3]
+
+
+def test_rank_prior_tree_reallocates_siblings_to_deeper_paths():
+    vocab_size = 400
+    transitions = torch.zeros((1, vocab_size, 6), dtype=torch.long)
+    valid = torch.ones((1, vocab_size), dtype=torch.bool)
+    for token in range(vocab_size):
+        transitions[0, token] = torch.tensor(
+            [(token * 6 + offset + 1) % vocab_size for offset in range(6)]
+        )
+
+    tokens, mask, positions, paths = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=6,
+        depth=3,
+        node_budget=63,
+        blocked_token_id=None,
+        priority_layout=True,
+    )
+
+    assert len(tokens) - 1 == 63
+    assert [(positions == level).sum().item() for level in range(1, 4)] == [
+        6,
+        26,
+        31,
+    ]
+    assert mask.shape == (1, 1, 64, 64)
+    assert max(map(len, paths)) == 3
+    assert paths[:3] == [[1], [1, 2], [1, 2, 3]]
+
+
+def test_score_prior_tree_follows_a_confident_contiguous_chain():
+    transitions = torch.zeros((1, 16, 2), dtype=torch.long)
+    valid = torch.ones((1, 16), dtype=torch.bool)
+    host = {
+        0: [1, 2],
+        1: [3, 4],
+        2: [5, 6],
+        3: [7, 8],
+    }
+    scores = {token: [0.9, 0.1] for token in host}
+
+    tokens, _, positions, paths = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=3,
+        node_budget=4,
+        blocked_token_id=None,
+        host_transitions=host,
+        host_transition_scores=scores,
+        score_priority_layout=True,
+    )
+
+    assert tokens == [0, 1, 3, 7, 2]
+    assert positions.tolist() == [0, 1, 2, 3, 1]
+    assert paths[:3] == [[1], [1, 2], [1, 2, 3]]
+
+
+def test_context_score_tree_prefers_exact_bigram_rows_and_records_context():
+    transitions = torch.empty(0, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+    host = {0: [2, 1], 1: [4, 3]}
+    scores = {0: [0.9, 0.1], 1: [0.9, 0.1]}
+    context = {(9, 0): [1, 2], (0, 1): [3, 4]}
+    context_scores = {(9, 0): [0.9, 0.1], (0, 1): [0.9, 0.1]}
+    metadata = {}
+
+    tokens, _, positions, paths = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=2,
+        node_budget=3,
+        blocked_token_id=None,
+        host_transitions=host,
+        host_transition_scores=scores,
+        root_previous_token=9,
+        host_context_transitions=context,
+        host_context_transition_scores=context_scores,
+        metadata_out=metadata,
+        score_priority_layout=True,
+    )
+
+    assert tokens == [0, 1, 3, 2]
+    assert positions.tolist() == [0, 1, 2, 1]
+    assert paths[:2] == [[1], [1, 2]]
+    assert metadata["semantic_previous_tokens"] == [9, 0, 1, 0]
+
+
+def test_trigram_score_tree_precedes_bigram_and_records_two_token_context():
+    transitions = torch.empty(0, dtype=torch.long)
+    valid = torch.empty(0, dtype=torch.bool)
+    host = {0: [1, 2], 2: [3, 4]}
+    scores = {0: [0.9, 0.1], 2: [0.9, 0.1]}
+    context = {(9, 0): [1, 2], (0, 2): [3, 4]}
+    context_scores = {(9, 0): [0.9, 0.1], (0, 2): [0.9, 0.1]}
+    trigrams = {(8, 9, 0): [2, 1], (9, 0, 2): [4, 3]}
+    trigram_scores = {(8, 9, 0): [0.9, 0.1], (9, 0, 2): [0.9, 0.1]}
+    metadata = {}
+
+    tokens, _, positions, paths = TreeRecyclingSpecModel._build_tree(
+        root_token=0,
+        transitions=transitions,
+        transition_valid=valid,
+        width=2,
+        depth=2,
+        node_budget=3,
+        blocked_token_id=None,
+        host_transitions=host,
+        host_transition_scores=scores,
+        root_previous_token=9,
+        root_previous_previous_token=8,
+        host_context_transitions=context,
+        host_context_transition_scores=context_scores,
+        host_trigram_transitions=trigrams,
+        host_trigram_transition_scores=trigram_scores,
+        metadata_out=metadata,
+        score_priority_layout=True,
+    )
+
+    assert tokens == [0, 2, 4, 1]
+    assert positions.tolist() == [0, 1, 2, 1]
+    assert paths[:2] == [[1], [1, 2]]
+    assert metadata["semantic_previous_tokens"] == [9, 0, 2, 0]
+    assert metadata["semantic_previous_previous_tokens"] == [8, 9, 0, 9]
 
 
 def test_best_verified_path_uses_longest_matching_branch():

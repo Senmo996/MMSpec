@@ -1,5 +1,7 @@
 """Grounded broad/shallow versus narrow/deep token-recycling trees."""
 
+import heapq
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -279,7 +281,58 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "visual-hst-backoff-gated",
         ):
             return broad_width, shallow_depth
-        if policy == "wide-plus2":
+        context_width_augmentation = {
+            "context-score-prior-deeper-wide-plus4": 4,
+            "context-score-trigram-deeper-wide-plus4": 4,
+            "context-score-trigram-deeper-wide-plus6": 6,
+            "context-score-trigram-deeper-wide-plus8": 8,
+            "context-score-prior-deeper-wide-plus5": 5,
+            "context-score-prior-deeper-wide-plus6": 6,
+            "context-score-prior-deeper-wide-plus8": 8,
+        }.get(policy)
+        if context_width_augmentation is not None:
+            return broad_width + context_width_augmentation, shallow_depth + 2
+        if policy in (
+            "wide-plus2",
+            "rank-prior-wide-plus2",
+            "rank-prior-deep-wide-plus2",
+            "rank-prior-deeper-wide-plus2",
+            "rank-prior-deepest-wide-plus2",
+            "score-prior-deep-wide-plus2",
+            "score-prior-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus2",
+            "context-score-calibrated-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus2-node55",
+            "context-score-prior-deeper-wide-plus2-node47",
+            "context-score-adaptive-safe-deeper-wide-plus2",
+            "score-prior-deepest-wide-plus2",
+            "score-prior-maxdeep-wide-plus2",
+            "score-adaptive-safe-deeper-wide-plus2",
+            "score-adaptive-deeper-wide-plus2",
+        ):
+            if policy in (
+                "rank-prior-deep-wide-plus2",
+                "score-prior-deep-wide-plus2",
+            ):
+                return broad_width + 2, shallow_depth + 1
+            if policy in (
+                "rank-prior-deeper-wide-plus2",
+                "score-prior-deeper-wide-plus2",
+                "context-score-prior-deeper-wide-plus2",
+                "context-score-calibrated-deeper-wide-plus2",
+                "context-score-prior-deeper-wide-plus2-node55",
+                "context-score-prior-deeper-wide-plus2-node47",
+                "context-score-adaptive-safe-deeper-wide-plus2",
+                "score-adaptive-safe-deeper-wide-plus2",
+                "score-adaptive-deeper-wide-plus2",
+            ):
+                return broad_width + 2, shallow_depth + 2
+            if policy == "rank-prior-deepest-wide-plus2":
+                return broad_width + 2, shallow_depth + 3
+            if policy == "score-prior-deepest-wide-plus2":
+                return broad_width + 2, shallow_depth + 3
+            if policy == "score-prior-maxdeep-wide-plus2":
+                return broad_width + 2, shallow_depth + 7
             return broad_width + 2, shallow_depth
         if policy in (
             "visual-wide-plus2",
@@ -376,6 +429,12 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             and grounding_score >= visual_threshold
         ):
             return min(max(int(fixed_width), 1), max(int(root_width), 0))
+        if policy == "context-score-prior-deeper-wide-plus6":
+            return min(8, max(int(root_width), 0))
+        if policy == "context-score-prior-deeper-wide-plus5":
+            return min(8, max(int(root_width), 0))
+        if policy == "context-score-prior-deeper-wide-plus8":
+            return min(6, max(int(root_width), 0))
         return max(int(root_width), 0)
 
     @staticmethod
@@ -534,86 +593,451 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         max_conditional_weight: float = 0.5,
         preserve_fallback_limit: int = 0,
         min_conditional_count: int = 2,
+        topology_cache=None,
+        host_transitions=None,
+        host_transition_scores=None,
+        root_previous_token=None,
+        root_previous_previous_token=None,
+        host_context_transitions=None,
+        host_context_transition_scores=None,
+        host_trigram_transitions=None,
+        host_trigram_transition_scores=None,
+        metadata_out=None,
+        priority_layout: bool = False,
+        score_priority_layout: bool = False,
+        score_hit_masses=None,
     ):
         # Node indices in the returned flat sequence start at one; zero is the
         # already-generated root token that has not yet entered the KV cache.
         nodes = []
-        frontier = [(root_token, 0, frozenset())]
-        for current_depth in range(1, depth + 1):
-            next_frontier = []
-            level_width = width if current_depth == 1 else branch_width
-            if level_width is None:
-                level_width = width
-            for parent_token, parent_index, path_edges in frontier:
-                if len(nodes) >= node_budget:
-                    break
-                seen_candidates = set()
-                candidates = TreeRecyclingSpecModel._transition_candidates(
-                    transitions,
-                    transition_valid,
-                    parent_token,
-                    transition_bin,
-                    level_width,
-                    fallback_bin=fallback_transition_bin,
-                    transition_counts=transition_counts,
-                    max_conditional_weight=max_conditional_weight,
-                    preserve_fallback_limit=preserve_fallback_limit,
-                    min_conditional_count=min_conditional_count,
+
+        def candidates_for(
+            parent_token,
+            level_width,
+            previous_token=None,
+            previous_previous_token=None,
+        ):
+            trigram_key = (
+                (
+                    int(previous_previous_token),
+                    int(previous_token),
+                    int(parent_token),
                 )
-                for candidate in candidates:
+                if previous_previous_token is not None
+                and previous_token is not None
+                else None
+            )
+            if (
+                host_trigram_transitions is not None
+                and trigram_key in host_trigram_transitions
+            ):
+                return host_trigram_transitions[trigram_key][:level_width]
+            context_key = (
+                (int(previous_token), int(parent_token))
+                if previous_token is not None
+                else None
+            )
+            if (
+                host_context_transitions is not None
+                and context_key in host_context_transitions
+            ):
+                return host_context_transitions[context_key][:level_width]
+            if host_transitions is not None:
+                return host_transitions.get(parent_token, ())[:level_width]
+            return TreeRecyclingSpecModel._transition_candidates(
+                transitions,
+                transition_valid,
+                parent_token,
+                transition_bin,
+                level_width,
+                fallback_bin=fallback_transition_bin,
+                transition_counts=transition_counts,
+                max_conditional_weight=max_conditional_weight,
+                preserve_fallback_limit=preserve_fallback_limit,
+                min_conditional_count=min_conditional_count,
+            )
+
+        if score_priority_layout:
+            branch_width = width if branch_width is None else branch_width
+            hit_masses = score_hit_masses or (
+                0.68,
+                0.63,
+                0.50,
+                0.43,
+                0.40,
+                0.38,
+            )
+            selected = {
+                (): {
+                    "token": int(root_token),
+                    "previous_token": root_previous_token,
+                    "previous_previous_token": (
+                        root_previous_previous_token
+                    ),
+                    "path_edges": frozenset(),
+                }
+            }
+            selected_nodes = []
+            candidate_cache = {}
+            pending = []
+
+            def push_children(parent_path, parent_score):
+                current_depth = len(parent_path) + 1
+                if current_depth > depth:
+                    return
+                parent = selected[parent_path]
+                parent_token = int(parent["token"])
+                previous_token = parent.get("previous_token")
+                previous_previous_token = parent.get(
+                    "previous_previous_token"
+                )
+                level_width = width if current_depth == 1 else branch_width
+                cache_key = (
+                    previous_previous_token,
+                    previous_token,
+                    parent_token,
+                    int(level_width),
+                )
+                candidates = candidate_cache.get(cache_key)
+                if candidates is None:
+                    candidates = list(
+                        candidates_for(
+                            parent_token,
+                            level_width,
+                            previous_token=previous_token,
+                            previous_previous_token=(
+                                previous_previous_token
+                            ),
+                        )
+                    )
+                    candidate_cache[cache_key] = candidates
+                context_key = (
+                    (int(previous_token), parent_token)
+                    if previous_token is not None
+                    else None
+                )
+                trigram_key = (
+                    (
+                        int(previous_previous_token),
+                        int(previous_token),
+                        parent_token,
+                    )
+                    if previous_previous_token is not None
+                    and previous_token is not None
+                    else None
+                )
+                if (
+                    host_trigram_transition_scores is not None
+                    and trigram_key in host_trigram_transition_scores
+                ):
+                    probabilities = host_trigram_transition_scores[
+                        trigram_key
+                    ]
+                elif (
+                    host_context_transition_scores is not None
+                    and context_key in host_context_transition_scores
+                ):
+                    probabilities = host_context_transition_scores[context_key]
+                elif host_transition_scores is not None:
+                    probabilities = host_transition_scores.get(parent_token, ())
+                else:
+                    probabilities = ()
+                if len(probabilities) < len(candidates):
+                    reciprocal = [
+                        1.0 / rank for rank in range(1, len(candidates) + 1)
+                    ]
+                    normalizer = sum(reciprocal) or 1.0
+                    probabilities = [value / normalizer for value in reciprocal]
+                hit_mass = hit_masses[
+                    min(current_depth - 1, len(hit_masses) - 1)
+                ]
+                seen_candidates = set()
+                for candidate_rank, candidate in enumerate(candidates, start=1):
                     candidate = int(candidate)
                     if candidate in seen_candidates:
                         continue
                     seen_candidates.add(candidate)
                     edge = (parent_token, candidate)
-                    if candidate == blocked_token_id or edge in path_edges:
+                    if (
+                        candidate == blocked_token_id
+                        or edge in parent["path_edges"]
+                    ):
                         continue
-                    flat_index = len(nodes) + 1
-                    nodes.append(
-                        {
-                            "token": candidate,
-                            "parent": parent_index,
-                            "depth": current_depth,
-                        }
+                    rank_path = (*parent_path, candidate_rank)
+                    score = (
+                        parent_score
+                        * hit_mass
+                        * float(probabilities[candidate_rank - 1])
                     )
-                    next_frontier.append(
-                        (candidate, flat_index, path_edges | {edge})
+                    heapq.heappush(
+                        pending,
+                        (
+                            -score,
+                            rank_path,
+                            candidate,
+                            parent_path,
+                            parent["path_edges"] | {edge},
+                        ),
                     )
+
+            push_children((), 1.0)
+            while pending and len(selected_nodes) < node_budget:
+                (
+                    negative_score,
+                    rank_path,
+                    candidate,
+                    parent_path,
+                    path_edges,
+                ) = heapq.heappop(pending)
+                node = {
+                    "token": candidate,
+                    "depth": len(rank_path),
+                    "rank": rank_path[-1],
+                    "rank_path": rank_path,
+                    "parent_path": parent_path,
+                    "previous_token": int(selected[parent_path]["token"]),
+                    "previous_previous_token": selected[parent_path].get(
+                        "previous_token"
+                    ),
+                    "path_edges": path_edges,
+                }
+                selected[rank_path] = node
+                selected_nodes.append(node)
+                push_children(rank_path, -negative_score)
+
+            selected_nodes.sort(key=lambda node: node["rank_path"])
+            flat_index_by_path = {
+                node["rank_path"]: index
+                for index, node in enumerate(selected_nodes, start=1)
+            }
+            nodes = [
+                {
+                    "token": node["token"],
+                    "parent": flat_index_by_path.get(node["parent_path"], 0),
+                    "depth": node["depth"],
+                    "rank": node["rank"],
+                }
+                for node in selected_nodes
+            ]
+        elif priority_layout:
+            # The rank diagnostics show a steeply concentrated recycling
+            # distribution.  Select the most likely rank paths globally rather
+            # than exhausting every second-hop sibling before allocating any
+            # third-hop nodes.  The priors are conditional hit rates, so the
+            # product estimates the value of adding one particular prefix.
+            rank_priors = (
+                (0.470, 0.090, 0.045, 0.040, 0.024, 0.016),
+                (0.450, 0.080, 0.040, 0.026, 0.016, 0.014),
+                (0.355, 0.080, 0.030, 0.015, 0.009, 0.007),
+                (0.350, 0.060, 0.030, 0.015, 0.008, 0.006),
+            )
+
+            def rank_prior(current_depth, rank):
+                row = rank_priors[min(current_depth - 1, len(rank_priors) - 1)]
+                if rank <= len(row):
+                    return row[rank - 1]
+                return row[-1] * (len(row) / rank) ** 2
+
+            branch_width = width if branch_width is None else branch_width
+            rank_path_cache = getattr(
+                TreeRecyclingSpecModel, "_priority_rank_path_cache", None
+            )
+            if rank_path_cache is None:
+                rank_path_cache = {}
+                TreeRecyclingSpecModel._priority_rank_path_cache = rank_path_cache
+            rank_path_key = (int(width), int(branch_width), int(depth))
+            ranked_paths = rank_path_cache.get(rank_path_key)
+            if ranked_paths is None:
+                scored_rank_paths = []
+
+                def enumerate_rank_paths(prefix, score):
+                    current_depth = len(prefix) + 1
+                    if current_depth > depth:
+                        return
+                    level_width = (
+                        width if current_depth == 1 else branch_width
+                    )
+                    for candidate_rank in range(1, level_width + 1):
+                        rank_path = (*prefix, candidate_rank)
+                        path_score = score * rank_prior(
+                            current_depth, candidate_rank
+                        )
+                        scored_rank_paths.append((path_score, rank_path))
+                        enumerate_rank_paths(rank_path, path_score)
+
+                enumerate_rank_paths((), 1.0)
+                scored_rank_paths.sort(key=lambda item: (-item[0], item[1]))
+                ranked_paths = tuple(path for _, path in scored_rank_paths)
+                rank_path_cache[rank_path_key] = ranked_paths
+            selected = {
+                (): {
+                    "token": int(root_token),
+                    "path_edges": frozenset(),
+                }
+            }
+            selected_nodes = []
+            candidate_cache = {}
+            for rank_path in ranked_paths:
+                if len(selected_nodes) >= node_budget:
+                    break
+                parent_path = rank_path[:-1]
+                parent = selected.get(parent_path)
+                if parent is None:
+                    continue
+                parent_token = int(parent["token"])
+                level_width = width if len(rank_path) == 1 else branch_width
+                cache_key = (parent_token, int(level_width))
+                candidates = candidate_cache.get(cache_key)
+                if candidates is None:
+                    candidates = list(candidates_for(parent_token, level_width))
+                    candidate_cache[cache_key] = candidates
+                candidate_rank = rank_path[-1]
+                if candidate_rank > len(candidates):
+                    continue
+                candidate = int(candidates[candidate_rank - 1])
+                edge = (parent_token, candidate)
+                path_edges = parent["path_edges"]
+                if candidate == blocked_token_id or edge in path_edges:
+                    continue
+                node = {
+                    "token": candidate,
+                    "depth": len(rank_path),
+                    "rank": candidate_rank,
+                    "rank_path": rank_path,
+                    "parent_path": parent_path,
+                    "path_edges": path_edges | {edge},
+                }
+                selected[rank_path] = node
+                selected_nodes.append(node)
+
+            # Lexicographic rank paths form a stable depth-first preorder.  The
+            # dominant rank-1 chain is therefore a contiguous KV prefix, which
+            # skips cache compaction on the most common accepted paths.
+            selected_nodes.sort(key=lambda node: node["rank_path"])
+            flat_index_by_path = {
+                node["rank_path"]: index
+                for index, node in enumerate(selected_nodes, start=1)
+            }
+            nodes = [
+                {
+                    "token": node["token"],
+                    "parent": flat_index_by_path.get(node["parent_path"], 0),
+                    "depth": node["depth"],
+                    "rank": node["rank"],
+                }
+                for node in selected_nodes
+            ]
+        else:
+            frontier = [(root_token, 0, frozenset())]
+            for current_depth in range(1, depth + 1):
+                next_frontier = []
+                level_width = width if current_depth == 1 else branch_width
+                if level_width is None:
+                    level_width = width
+                for parent_token, parent_index, path_edges in frontier:
                     if len(nodes) >= node_budget:
                         break
-            frontier = next_frontier
-            if not frontier or len(nodes) >= node_budget:
-                break
+                    seen_candidates = set()
+                    candidates = candidates_for(parent_token, level_width)
+                    for candidate_rank, candidate in enumerate(
+                        candidates, start=1
+                    ):
+                        candidate = int(candidate)
+                        if candidate in seen_candidates:
+                            continue
+                        seen_candidates.add(candidate)
+                        edge = (parent_token, candidate)
+                        if candidate == blocked_token_id or edge in path_edges:
+                            continue
+                        flat_index = len(nodes) + 1
+                        nodes.append(
+                            {
+                                "token": candidate,
+                                "parent": parent_index,
+                                "depth": current_depth,
+                                "rank": candidate_rank,
+                            }
+                        )
+                        next_frontier.append(
+                            (candidate, flat_index, path_edges | {edge})
+                        )
+                        if len(nodes) >= node_budget:
+                            break
+                frontier = next_frontier
+                if not frontier or len(nodes) >= node_budget:
+                    break
 
-        tree_len = len(nodes) + 1
-        # These trees contain at most a few dozen nodes.  Build their topology
-        # in host memory and submit two compact transfers instead of launching
-        # a separate GPU scalar-write kernel for every ancestor relation.
-        mask_rows = [[False] * tree_len for _ in range(tree_len)]
-        mask_rows[0][0] = True
-        position_values = [0] * tree_len
-        paths: List[List[int]] = []
-        for flat_index, node in enumerate(nodes, start=1):
-            mask_rows[flat_index][flat_index] = True
-            mask_rows[flat_index][0] = True
-            position_values[flat_index] = node["depth"]
-            path = [flat_index]
-            parent = node["parent"]
-            while parent > 0:
-                mask_rows[flat_index][parent] = True
-                path.append(parent)
-                parent = nodes[parent - 1]["parent"]
-            paths.append(list(reversed(path)))
+        topology_key = (
+            transitions.device.type,
+            transitions.device.index,
+            tuple((int(node["parent"]), int(node["depth"])) for node in nodes),
+        )
+        cached_topology = (
+            topology_cache.get(topology_key)
+            if topology_cache is not None
+            else None
+        )
+        if cached_topology is not None:
+            mask, positions, paths = cached_topology
+        else:
+            tree_len = len(nodes) + 1
+            # These trees contain at most a few dozen nodes.  Build their
+            # topology in host memory and submit two compact transfers instead
+            # of launching a GPU scalar-write kernel per ancestor relation.
+            mask_rows = [[False] * tree_len for _ in range(tree_len)]
+            mask_rows[0][0] = True
+            position_values = [0] * tree_len
+            paths: List[List[int]] = []
+            for flat_index, node in enumerate(nodes, start=1):
+                mask_rows[flat_index][flat_index] = True
+                mask_rows[flat_index][0] = True
+                position_values[flat_index] = node["depth"]
+                path = [flat_index]
+                parent = node["parent"]
+                while parent > 0:
+                    mask_rows[flat_index][parent] = True
+                    path.append(parent)
+                    parent = nodes[parent - 1]["parent"]
+                paths.append(list(reversed(path)))
 
-        mask = torch.tensor(
-            mask_rows, dtype=torch.bool, device=transitions.device
-        )
-        positions = torch.tensor(
-            position_values, dtype=torch.long, device=transitions.device
-        )
+            mask = torch.tensor(
+                mask_rows, dtype=torch.bool, device=transitions.device
+            )[None, None]
+            positions = torch.tensor(
+                position_values, dtype=torch.long, device=transitions.device
+            )
+            if topology_cache is not None:
+                if len(topology_cache) >= 256:
+                    topology_cache.clear()
+                topology_cache[topology_key] = (mask, positions, paths)
 
         flat_tokens = [root_token] + [node["token"] for node in nodes]
-        return flat_tokens, mask[None, None], positions, paths
+        if metadata_out is not None:
+            metadata_out["node_ranks"] = [0] + [
+                int(node["rank"]) for node in nodes
+            ]
+            semantic_previous_tokens = [
+                root_previous_token,
+                *[
+                    int(root_token)
+                    if int(node["parent"]) == 0
+                    else int(nodes[int(node["parent"]) - 1]["token"])
+                    for node in nodes
+                ],
+            ]
+            metadata_out["semantic_previous_tokens"] = (
+                semantic_previous_tokens
+            )
+            metadata_out["semantic_previous_previous_tokens"] = [
+                root_previous_previous_token,
+                *[
+                    root_previous_token
+                    if int(node["parent"]) == 0
+                    else semantic_previous_tokens[int(node["parent"])]
+                    for node in nodes
+                ],
+            ]
+        return flat_tokens, mask, positions, paths
 
     @staticmethod
     def _requires_cache_compaction(accepted_path: List[int]) -> bool:
@@ -843,6 +1267,28 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "fixed",
             "broad",
             "wide-plus2",
+            "rank-prior-wide-plus2",
+            "rank-prior-deep-wide-plus2",
+            "rank-prior-deeper-wide-plus2",
+            "rank-prior-deepest-wide-plus2",
+            "score-prior-deep-wide-plus2",
+            "score-prior-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus4",
+            "context-score-trigram-deeper-wide-plus4",
+            "context-score-trigram-deeper-wide-plus6",
+            "context-score-trigram-deeper-wide-plus8",
+            "context-score-prior-deeper-wide-plus5",
+            "context-score-prior-deeper-wide-plus6",
+            "context-score-prior-deeper-wide-plus8",
+            "context-score-calibrated-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus2-node55",
+            "context-score-prior-deeper-wide-plus2-node47",
+            "context-score-adaptive-safe-deeper-wide-plus2",
+            "score-prior-deepest-wide-plus2",
+            "score-prior-maxdeep-wide-plus2",
+            "score-adaptive-safe-deeper-wide-plus2",
+            "score-adaptive-deeper-wide-plus2",
             "narrow",
             "spine",
             "short",
@@ -885,6 +1331,28 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         tree_node_budget = max(int(tree_node_budget), 1)
         uses_augmented_width = draft_policy in (
             "wide-plus2",
+            "rank-prior-wide-plus2",
+            "rank-prior-deep-wide-plus2",
+            "rank-prior-deeper-wide-plus2",
+            "rank-prior-deepest-wide-plus2",
+            "score-prior-deep-wide-plus2",
+            "score-prior-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus4",
+            "context-score-trigram-deeper-wide-plus4",
+            "context-score-trigram-deeper-wide-plus6",
+            "context-score-trigram-deeper-wide-plus8",
+            "context-score-prior-deeper-wide-plus5",
+            "context-score-prior-deeper-wide-plus6",
+            "context-score-prior-deeper-wide-plus8",
+            "context-score-calibrated-deeper-wide-plus2",
+            "context-score-prior-deeper-wide-plus2-node55",
+            "context-score-prior-deeper-wide-plus2-node47",
+            "context-score-adaptive-safe-deeper-wide-plus2",
+            "score-prior-deepest-wide-plus2",
+            "score-prior-maxdeep-wide-plus2",
+            "score-adaptive-safe-deeper-wide-plus2",
+            "score-adaptive-deeper-wide-plus2",
             "visual-wide-plus2",
             "visual-wide-plus2-reverse",
             "visual-rootwide-plus2",
@@ -895,10 +1363,24 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "grounded-residual",
             "grounded-residual-reverse",
         )
+        context_width_augmentation = {
+            "context-score-prior-deeper-wide-plus4": 4,
+            "context-score-trigram-deeper-wide-plus4": 4,
+            "context-score-trigram-deeper-wide-plus6": 6,
+            "context-score-trigram-deeper-wide-plus8": 8,
+            "context-score-prior-deeper-wide-plus5": 5,
+            "context-score-prior-deeper-wide-plus6": 6,
+            "context-score-prior-deeper-wide-plus8": 8,
+        }.get(draft_policy, 0)
         matrix_top_k = max(
             int(matrix_top_k),
             tree_fixed_width,
-            tree_broad_width + (2 if uses_augmented_width else 0),
+            tree_broad_width
+            + (
+                context_width_augmentation
+                if context_width_augmentation > 0
+                else (2 if uses_augmented_width else 0)
+            ),
             visual_lexical_width if visual_lexical_enabled else 1,
             1,
         )
@@ -1107,28 +1589,176 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "grounded-hybrid-reverse",
         )
         num_transition_bins = 3 if use_grounded_conditionals else (2 if use_modal_bins else 1)
+        use_host_transitions = bool(
+            num_transition_bins == 1
+            and not cover_enabled
+            and not visual_lexical_enabled
+            and not use_suffix_hybrid
+            and not verification_compact_path_repair
+        )
+        host_transitions = {} if use_host_transitions else None
+        use_context_transitions = draft_policy.startswith("context-score-")
+        use_trigram_transitions = draft_policy.startswith(
+            "context-score-trigram-"
+        )
+        use_score_priority = draft_policy.startswith(
+            ("score-prior-", "score-adaptive-", "context-score-")
+        )
+        host_transition_scores = {} if use_score_priority else None
+        host_context_transitions = {} if use_context_transitions else None
+        host_context_transition_scores = (
+            {} if use_context_transitions else None
+        )
+        host_trigram_transitions = {} if use_trigram_transitions else None
+        host_trigram_transition_scores = (
+            {} if use_trigram_transitions else None
+        )
         vocab_size = int(self.base_model.config.vocab_size)
-        transitions = torch.zeros(
-            (num_transition_bins, vocab_size, matrix_top_k),
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        transition_valid = torch.zeros(
-            (num_transition_bins, vocab_size),
-            dtype=torch.bool,
-            device=input_ids.device,
-        )
-        transition_counts = torch.zeros(
-            (num_transition_bins, vocab_size),
-            dtype=torch.int32,
-            device=input_ids.device,
+        if host_transitions is not None:
+            # Plain recycling policies never read the dense GPU tables.  Keep a
+            # device sentinel for tree tensor placement and avoid zeroing a
+            # multi-megabyte vocab-sized matrix at the start of every sample.
+            transitions = torch.empty(
+                0, dtype=torch.long, device=input_ids.device
+            )
+            transition_valid = torch.empty(
+                0, dtype=torch.bool, device=input_ids.device
+            )
+        else:
+            transitions = torch.zeros(
+                (num_transition_bins, vocab_size, matrix_top_k),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            transition_valid = torch.zeros(
+                (num_transition_bins, vocab_size),
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+        transition_counts = (
+            torch.zeros(
+                (num_transition_bins, vocab_size),
+                dtype=torch.int32,
+                device=input_ids.device,
+            )
+            if use_grounded_conditionals
+            else None
         )
 
-        def store_transitions(output, token_ids):
+        def store_transitions(
+            output,
+            token_ids,
+            token_values=None,
+            previous_token_values=None,
+            previous_previous_token_values=None,
+            output_row_indices=None,
+        ):
             query_count = int(token_ids.numel())
-            topk_ids = output.logits[0, :query_count].topk(
-                matrix_top_k, dim=-1
-            ).indices
+            if output_row_indices is None:
+                transition_logits = output.logits[0, :query_count]
+            else:
+                transition_logits = output.logits[0].index_select(
+                    0, output_row_indices
+                )
+                if int(transition_logits.shape[0]) != query_count:
+                    raise ValueError(
+                        "Transition row selection must match token count"
+                    )
+            topk = transition_logits.topk(matrix_top_k, dim=-1)
+            topk_ids = topk.indices
+            if host_transitions is not None:
+                rows = topk_ids.tolist()
+                score_rows = (
+                    torch.softmax(topk.values.float(), dim=-1).tolist()
+                    if host_transition_scores is not None
+                    else None
+                )
+                tokens = (
+                    [int(token) for token in token_values]
+                    if token_values is not None
+                    else [int(token) for token in token_ids.tolist()]
+                )
+                previous_tokens = (
+                    list(previous_token_values)
+                    if previous_token_values is not None
+                    else None
+                )
+                previous_previous_tokens = (
+                    list(previous_previous_token_values)
+                    if previous_previous_token_values is not None
+                    else None
+                )
+                # CUDA advanced-index assignment retains the first value for
+                # duplicate indices within one update.  Mirror that behavior
+                # so this host lookup table is semantically identical.
+                seen_tokens = set()
+                seen_contexts = set()
+                seen_trigrams = set()
+                for row_index, (token, row) in enumerate(zip(tokens, rows)):
+                    previous_token = (
+                        previous_tokens[row_index]
+                        if previous_tokens is not None
+                        else None
+                    )
+                    context_key = (
+                        (int(previous_token), int(token))
+                        if previous_token is not None
+                        else None
+                    )
+                    previous_previous_token = (
+                        previous_previous_tokens[row_index]
+                        if previous_previous_tokens is not None
+                        else None
+                    )
+                    trigram_key = (
+                        (
+                            int(previous_previous_token),
+                            int(previous_token),
+                            int(token),
+                        )
+                        if previous_previous_token is not None
+                        and previous_token is not None
+                        else None
+                    )
+                    update_unigram = token not in seen_tokens
+                    update_context = bool(
+                        context_key is not None
+                        and context_key not in seen_contexts
+                    )
+                    update_trigram = bool(
+                        trigram_key is not None
+                        and trigram_key not in seen_trigrams
+                    )
+                    if (
+                        not update_unigram
+                        and not update_context
+                        and not update_trigram
+                    ):
+                        continue
+                    converted_row = [int(value) for value in row]
+                    normalized_scores = None
+                    if score_rows is not None:
+                        normalized_scores = score_rows[row_index]
+                    if update_unigram:
+                        seen_tokens.add(token)
+                        host_transitions[token] = converted_row
+                        if normalized_scores is not None:
+                            host_transition_scores[token] = normalized_scores
+                    if update_context:
+                        seen_contexts.add(context_key)
+                        host_context_transitions[context_key] = converted_row
+                        if normalized_scores is not None:
+                            host_context_transition_scores[
+                                context_key
+                            ] = normalized_scores
+                    if update_trigram:
+                        seen_trigrams.add(trigram_key)
+                        host_trigram_transitions[trigram_key] = converted_row
+                        if normalized_scores is not None:
+                            host_trigram_transition_scores[
+                                trigram_key
+                            ] = normalized_scores
+                return
             if use_grounded_conditionals:
                 global_bins = torch.zeros_like(token_ids, dtype=torch.long)
                 transitions[global_bins, token_ids] = topk_ids
@@ -1158,14 +1788,42 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     ).long()
             transitions[bins, token_ids] = topk_ids
             transition_valid[bins, token_ids] = True
-            transition_counts.index_put_(
-                (bins, token_ids),
-                torch.ones_like(token_ids, dtype=torch.int32),
-                accumulate=True,
-            )
+            if transition_counts is not None:
+                transition_counts.index_put_(
+                    (bins, token_ids),
+                    torch.ones_like(token_ids, dtype=torch.int32),
+                    accumulate=True,
+                )
 
         prompt_ids = input_ids[0]
-        store_transitions(init_output, prompt_ids)
+        # Building exact bigram rows for every multimodal prompt position is
+        # disproportionately expensive on high-resolution images.  Seed the
+        # cheap unigram fallback from prefill and learn context rows online
+        # from the much smaller verified generation trees instead.
+        if host_transitions is not None:
+            prompt_values = [int(token) for token in prompt_ids.tolist()]
+            seen_prompt_tokens = set()
+            unique_prompt_indices = []
+            unique_prompt_values = []
+            for prompt_index, token in enumerate(prompt_values):
+                if token in seen_prompt_tokens:
+                    continue
+                seen_prompt_tokens.add(token)
+                unique_prompt_indices.append(prompt_index)
+                unique_prompt_values.append(token)
+            prompt_row_indices = torch.tensor(
+                unique_prompt_indices,
+                dtype=torch.long,
+                device=prompt_ids.device,
+            )
+            store_transitions(
+                init_output,
+                prompt_ids.index_select(0, prompt_row_indices),
+                token_values=unique_prompt_values,
+                output_row_indices=prompt_row_indices,
+            )
+        else:
+            store_transitions(init_output, prompt_ids)
 
         init_token = torch.argmax(init_output.logits[:, -1, :], dim=-1)
         input_ids = torch.cat([input_ids, init_token[:, None]], dim=1)
@@ -1177,6 +1835,12 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         acceptance_lengths = []
         trace = []
         idx = -1
+        topology_cache = getattr(
+            self, "tree_recycling_topology_cache", None
+        )
+        if topology_cache is None:
+            topology_cache = {}
+            self.tree_recycling_topology_cache = topology_cache
 
         for idx in range(max_length - prompt_length):
             generated = int(input_ids.shape[1] - prompt_length)
@@ -1221,9 +1885,89 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             else:
                 transition_bin = is_high_visual if num_transition_bins > 1 else 0
                 fallback_transition_bin = None
-            root_token = int(input_ids[0, -1].item())
-            root_row_valid_before_backoff = bool(
-                transition_valid[transition_bin, root_token].item()
+            if use_trigram_transitions and input_ids.shape[1] >= 3:
+                (
+                    root_previous_previous_token,
+                    root_previous_token,
+                    root_token,
+                ) = [int(token) for token in input_ids[0, -3:].tolist()]
+            elif use_context_transitions and input_ids.shape[1] >= 2:
+                root_previous_token, root_token = [
+                    int(token) for token in input_ids[0, -2:].tolist()
+                ]
+                root_previous_previous_token = None
+            else:
+                root_token = int(input_ids[0, -1].item())
+                root_previous_token = None
+                root_previous_previous_token = None
+            root_context_key = (
+                (root_previous_token, root_token)
+                if root_previous_token is not None
+                else None
+            )
+            root_trigram_key = (
+                (
+                    root_previous_previous_token,
+                    root_previous_token,
+                    root_token,
+                )
+                if root_previous_previous_token is not None
+                and root_previous_token is not None
+                else None
+            )
+            if (
+                host_trigram_transition_scores is not None
+                and root_trigram_key in host_trigram_transition_scores
+            ):
+                root_transition_top_probability = float(
+                    host_trigram_transition_scores[root_trigram_key][0]
+                )
+            elif (
+                host_context_transition_scores is not None
+                and root_context_key in host_context_transition_scores
+            ):
+                root_transition_top_probability = float(
+                    host_context_transition_scores[root_context_key][0]
+                )
+            elif (
+                host_transition_scores is not None
+                and root_token in host_transition_scores
+            ):
+                root_transition_top_probability = float(
+                    host_transition_scores[root_token][0]
+                )
+            else:
+                root_transition_top_probability = None
+            effective_tree_node_budget = tree_node_budget
+            if draft_policy == "context-score-prior-deeper-wide-plus2-node55":
+                effective_tree_node_budget = min(tree_node_budget, 55)
+            elif draft_policy == "context-score-prior-deeper-wide-plus2-node47":
+                effective_tree_node_budget = min(tree_node_budget, 47)
+            elif (
+                draft_policy
+                == "context-score-adaptive-safe-deeper-wide-plus2"
+                and root_transition_top_probability is not None
+                and root_transition_top_probability >= 0.85
+            ):
+                effective_tree_node_budget = min(tree_node_budget, 47)
+            if (
+                draft_policy == "score-adaptive-safe-deeper-wide-plus2"
+                and root_transition_top_probability is not None
+                and root_transition_top_probability >= 0.85
+            ):
+                effective_tree_node_budget = min(tree_node_budget, 47)
+            elif (
+                draft_policy == "score-adaptive-deeper-wide-plus2"
+                and root_transition_top_probability is not None
+            ):
+                if root_transition_top_probability >= 0.90:
+                    effective_tree_node_budget = min(tree_node_budget, 31)
+                elif root_transition_top_probability >= 0.75:
+                    effective_tree_node_budget = min(tree_node_budget, 47)
+            root_row_valid_before_backoff = (
+                root_token in host_transitions
+                if host_transitions is not None
+                else bool(transition_valid[transition_bin, root_token].item())
             )
             visual_backoff_eligible = self._visual_lexical_backoff_active(
                 draft_policy,
@@ -1401,13 +2145,18 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             source_token,
                             next_token,
                         )
+            tree_metadata = (
+                {}
+                if verification_trace_diagnostics or use_context_transitions
+                else None
+            )
             flat_tokens, tree_mask, tree_positions, paths = self._build_tree(
                 root_token,
                 transitions,
                 transition_valid,
                 width,
                 depth,
-                tree_node_budget,
+                effective_tree_node_budget,
                 image_token_id,
                 branch_width=branch_width,
                 transition_bin=transition_bin,
@@ -1415,6 +2164,30 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 transition_counts=transition_counts,
                 preserve_fallback_limit=(
                     tree_broad_width if use_grounded_residual else 0
+                ),
+                topology_cache=topology_cache,
+                host_transitions=host_transitions,
+                host_transition_scores=host_transition_scores,
+                root_previous_token=root_previous_token,
+                root_previous_previous_token=(
+                    root_previous_previous_token
+                ),
+                host_context_transitions=host_context_transitions,
+                host_context_transition_scores=(
+                    host_context_transition_scores
+                ),
+                host_trigram_transitions=host_trigram_transitions,
+                host_trigram_transition_scores=(
+                    host_trigram_transition_scores
+                ),
+                metadata_out=tree_metadata,
+                priority_layout=draft_policy.startswith("rank-prior-"),
+                score_priority_layout=use_score_priority,
+                score_hit_masses=(
+                    (0.66, 0.65, 0.62, 0.54, 0.38, 0.36)
+                    if draft_policy
+                    == "context-score-calibrated-deeper-wide-plus2"
+                    else None
                 ),
             )
             num_nodes = len(flat_tokens) - 1
@@ -1457,6 +2230,13 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 ),
                 "transition_bin": int(transition_bin),
                 "num_transition_bins": int(num_transition_bins),
+                "host_transition_table": bool(use_host_transitions),
+                "root_transition_top_probability": (
+                    root_transition_top_probability
+                ),
+                "effective_tree_node_budget": int(
+                    effective_tree_node_budget
+                ),
                 "conditional_transition_count": int(conditional_count),
                 "conditional_mix_weight": float(conditional_mix_weight),
                 "conditional_global_overlap": conditional_global_overlap,
@@ -1527,13 +2307,26 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     output_hidden_states=need_all_hidden_states,
                     output_last_hidden_state=need_hidden_states,
                 )
-                store_transitions(output, input_ids[0, -1:])
+                store_transitions(
+                    output,
+                    input_ids[0, -1:],
+                    token_values=[root_token],
+                    previous_token_values=[root_previous_token]
+                    if use_context_transitions
+                    else None,
+                    previous_previous_token_values=[
+                        root_previous_previous_token
+                    ]
+                    if use_trigram_transitions
+                    else None,
+                )
                 next_id = torch.argmax(output.logits[:, -1, :], dim=-1)
                 input_ids = torch.cat([input_ids, next_id[:, None]], dim=1)
                 if verification_trace_diagnostics:
-                    top_values = torch.topk(
+                    top = torch.topk(
                         output.logits[0, -1].float(), k=2
-                    ).values
+                    )
+                    top_values = top.values
                     record.update(
                         {
                             "verification_committed_token_ids": [
@@ -1541,6 +2334,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             ],
                             "verification_token_margins": [
                                 float((top_values[0] - top_values[1]).item())
+                            ],
+                            "verification_top_token_ids": [
+                                [int(token_id) for token_id in top.indices.tolist()]
                             ],
                             "verification_min_margin": float(
                                 (top_values[0] - top_values[1]).item()
@@ -1622,7 +2418,23 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     finally:
                         self.base_model.model.tree_mask = None
 
-                store_transitions(output, tree_input[0])
+                store_transitions(
+                    output,
+                    tree_input[0],
+                    token_values=flat_tokens,
+                    previous_token_values=(
+                        tree_metadata["semantic_previous_tokens"]
+                        if use_context_transitions
+                        else None
+                    ),
+                    previous_previous_token_values=(
+                        tree_metadata[
+                            "semantic_previous_previous_tokens"
+                        ]
+                        if use_trigram_transitions
+                        else None
+                    ),
+                )
                 if cover_probe_active:
                     actual_tree_length = int(tree_input.shape[1])
                     cover_view_logits = torch.cat(
@@ -1924,9 +2736,10 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                         committed_logits = output.logits[
                             0, committed_rows
                         ].float()
-                    top_values = torch.topk(
+                    top = torch.topk(
                         committed_logits, k=2, dim=-1
-                    ).values
+                    )
+                    top_values = top.values
                     margins = (top_values[:, 0] - top_values[:, 1]).tolist()
                     record.update(
                         {
@@ -1937,11 +2750,23 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             "verification_token_margins": [
                                 float(value) for value in margins
                             ],
+                            "verification_top_token_ids": [
+                                [int(token_id) for token_id in row]
+                                for row in top.indices.tolist()
+                            ],
                             "verification_min_margin": min(
                                 (float(value) for value in margins),
                                 default=None,
                             ),
                             "verification_accepted_path": list(accepted_path),
+                            "verification_accepted_ranks": (
+                                [
+                                    int(tree_metadata["node_ranks"][node_index])
+                                    for node_index in accepted_path
+                                ]
+                                if tree_metadata is not None
+                                else []
+                            ),
                         }
                     )
                 if visual_hst_backoff_active and hst_trace_diagnostics:
