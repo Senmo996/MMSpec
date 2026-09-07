@@ -4,7 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
-from analyze_policy_pairs import _sample_rows, _summarize_rows
+try:
+    from .analyze_policy_pairs import _sample_rows, _summarize_rows
+except ImportError:  # Direct script execution from MMSpec/evaluation.
+    from analyze_policy_pairs import _sample_rows, _summarize_rows
 
 
 def _load_runs(roots, policy):
@@ -31,6 +34,8 @@ def compare(roots, policy, baseline, exact_reference, bootstrap_samples):
             continue
         current_speed = current["tokens"] / current["wall_time"]
         reference_speed = reference["tokens"] / reference["wall_time"]
+        if reference_speed <= 0:
+            continue
         rows.append(
             {
                 "run_index": key[0],

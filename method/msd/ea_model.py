@@ -194,7 +194,8 @@ class EaModel(nn.Module):
     def _get_language_model(self):
         """Get the language model part (handles both original and HF LLaVA)."""
         if self._is_hf_llava:
-            return self.base_model.language_model.model
+            language_model = self.base_model.language_model
+            return getattr(language_model, "model", language_model)
         else:
             return self.base_model.model
     
@@ -784,7 +785,7 @@ class EaModel(nn.Module):
                 self.current_length_data = current_length_data
 
             if inputs_embeds is not None:
-                if self.base_model.config.model_type == "qwen2_vl": 
+                if self.base_model.config.model_type in {"qwen2_vl", "qwen2_5_vl"}:
                     outputs = self.base_model(input_ids=input_ids, inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True)
                 else:
                     outputs = self.base_model(input_ids=input_ids, past_key_values=past_key_values, use_cache=True)

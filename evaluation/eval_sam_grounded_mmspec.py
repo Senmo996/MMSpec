@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,18 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from evaluation.time_breakdown import build_time_breakdown_tracker
+from evaluation.selective_reuse_protocol import (
+    apply_teacher_forced_pixel_probes,
+    deterministic_cluster_split,
+)
+from evaluation.selective_reuse_content_ablation_protocol import (
+    apply_teacher_forced_content_ablation_probes,
+)
+from evaluation.selective_reuse_counterfactual_bank_protocol import (
+    apply_teacher_forced_counterfactual_bank_probes,
+    build_matched_wrong_image_pairs,
+    resize_wrong_image,
+)
 from evaluation.utils import (
     build_prompt,
     get_common_args,
@@ -82,6 +95,17 @@ def _select_topic_indices(data, samples_per_topic: int, topic_offset: int = 0):
     return selected_indices
 
 
+def _sample_order_indices(num_samples: int, seed=None):
+    """Return a reproducible permutation for cache-order sensitivity tests."""
+
+    if num_samples < 0:
+        raise ValueError("num_samples must be non-negative")
+    indices = list(range(num_samples))
+    if seed is not None:
+        random.Random(int(seed)).shuffle(indices)
+    return indices
+
+
 def _policy_kwargs(args, policy):
     values = {
         "draft_policy": policy,
@@ -99,9 +123,21 @@ def _policy_kwargs(args, policy):
     }
     if args.draft_engine in ("recycling", "tree-recycling"):
         values["matrix_top_k"] = args.matrix_top_k
+        values["candidate_trace_diagnostics"] = bool(
+            getattr(args, "candidate_trace_diagnostics", False)
+        )
     if args.draft_engine == "tree-recycling":
         values.update(
             {
+                "selective_reuse_diagnostics": bool(
+                    getattr(args, "selective_reuse_diagnostics", False)
+                    and policy != "target"
+                ),
+                "selective_reuse_probe_mode": getattr(
+                    args,
+                    "selective_reuse_probe_mode",
+                    "packed-attention",
+                ),
                 "tree_fixed_width": args.tree_fixed_width,
                 "tree_fixed_depth": args.tree_fixed_depth,
                 "tree_broad_width": args.tree_broad_width,
@@ -205,6 +241,7 @@ def evaluate(args):
     tracker = build_time_breakdown_tracker(model)
 
     data = load_mmspec_data(args.data_folder)
+    wrong_image_source_data = data
     if args.samples_per_topic is not None:
         selected_indices = _select_topic_indices(
             data,
@@ -212,9 +249,58 @@ def evaluate(args):
             args.topic_offset,
         )
         data = data.select(selected_indices)
+    if args.sample_order_seed is not None:
+        data = data.select(_sample_order_indices(len(data), args.sample_order_seed))
+    if args.sample_order_offset:
+        data = data.select(
+            range(min(int(args.sample_order_offset), len(data)), len(data))
+        )
     if args.max_samples is not None:
         data = data.select(range(min(args.max_samples, len(data))))
+    if args.counterfactual_wrong_image_pool == "selected":
+        wrong_image_source_data = data
+
+    wrong_image_pairs = None
+    if (
+        args.selective_reuse_diagnostics
+        and args.selective_reuse_probe_mode
+        == "teacher-forced-counterfactual-bank"
+    ):
+        wrong_image_pairs = build_matched_wrong_image_pairs(
+            data,
+            None,
+            seed=args.split_seed,
+            name="MMSpec",
+            source_rows=wrong_image_source_data,
+        )
+        fallback_ratio = sum(
+            bool(pair["used_category_fallback"])
+            for pair in wrong_image_pairs
+        ) / len(wrong_image_pairs)
+        print(
+            "wrong_image_category_fallback_ratio="
+            f"{fallback_ratio:.6f}",
+            flush=True,
+        )
+
+    analysis_splits = ["all"] * len(data)
+    if args.selective_reuse_diagnostics:
+        analysis_splits = deterministic_cluster_split(
+            [str(sample.get("image_id", sample["id"])) for sample in data],
+            discovery_fraction=args.discovery_fraction,
+            seed=args.split_seed,
+            stratum="MMSpec",
+        )
+    evaluation_positions = sorted(
+        range(len(data)),
+        key=lambda index: (
+            0 if analysis_splits[index] == "discovery" else 1,
+            index,
+        ),
+    )
     print(f"Loaded {len(data)} samples")
+    print(f"Sample order seed: {args.sample_order_seed}")
+    print(f"Sample order offset: {args.sample_order_offset}")
     print(f"Policies: {','.join(args.policies)}")
     print(f"Draft engine: {args.draft_engine}")
     print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
@@ -239,6 +325,23 @@ def evaluate(args):
         f"{qshape_exact_root_attention_layers}"
     )
     print(f"policy_trace_enabled={not args.no_policy_trace}")
+    print(
+        "selective_reuse_diagnostics="
+        f"{args.selective_reuse_diagnostics}"
+    )
+    print(f"selective_reuse_probe_mode={args.selective_reuse_probe_mode}")
+    if args.selective_reuse_diagnostics:
+        print(
+            "analysis_split_counts="
+            + json.dumps(
+                {
+                    split: analysis_splits.count(split)
+                    for split in ("discovery", "heldout")
+                },
+                sort_keys=True,
+            )
+        )
+        print(f"analysis_split_seed={args.split_seed}")
 
     if args.sanity:
         run_sanity_check(args, model, tokenizer, data)
@@ -275,9 +378,21 @@ def evaluate(args):
         reset_persistent_cache()
     print("Warmup done")
 
-    for sample_index, sample in enumerate(tqdm(data, desc="Evaluating interleaved policies")):
+    active_split = None
+    progress = tqdm(evaluation_positions, desc="Evaluating interleaved policies")
+    for run_index, sample_position in enumerate(progress):
+        sample = data[sample_position]
+        analysis_split = analysis_splits[sample_position]
+        if analysis_split != active_split:
+            if callable(reset_persistent_cache):
+                reset_persistent_cache()
+                print(
+                    f"Cleared persistent caches before split={analysis_split}",
+                    flush=True,
+                )
+            active_split = analysis_split
         if args.rotate_policy_order:
-            offset = sample_index % len(args.policies)
+            offset = run_index % len(args.policies)
             policy_order = args.policies[offset:] + args.policies[:offset]
         else:
             policy_order = args.policies
@@ -299,6 +414,7 @@ def evaluate(args):
                 wall_times = []
                 acceptance_lengths = []
                 policy_traces = []
+                selective_probe_metadata = []
                 draft_times = []
                 target_times = []
 
@@ -346,6 +462,82 @@ def evaluate(args):
                         trace = []
                     else:
                         output_ids, n_new, idx, accepted, trace = result
+                    if (
+                        trace
+                        and policy != "target"
+                        and args.selective_reuse_diagnostics
+                        and args.selective_reuse_probe_mode
+                        in (
+                            "teacher-forced-pixel",
+                            "teacher-forced-content-ablation",
+                            "teacher-forced-counterfactual-bank",
+                        )
+                    ):
+                        if args.selective_reuse_probe_mode == "teacher-forced-pixel":
+                            probe_metadata = apply_teacher_forced_pixel_probes(
+                                model.base_model,
+                                model_inputs,
+                                output_ids,
+                                prompt_length=input_len,
+                                trace=trace,
+                                num_regions=args.cover_num_probes,
+                                top_k=args.matrix_top_k,
+                                view_batch_size=args.visual_probe_batch_size,
+                            )
+                        elif (
+                            args.selective_reuse_probe_mode
+                            == "teacher-forced-content-ablation"
+                        ):
+                            probe_metadata = (
+                                apply_teacher_forced_content_ablation_probes(
+                                    model.base_model,
+                                    model_inputs,
+                                    output_ids,
+                                    prompt_length=input_len,
+                                    trace=trace,
+                                    top_k=args.matrix_top_k,
+                                    view_batch_size=args.visual_probe_batch_size,
+                                )
+                            )
+                        else:
+                            if wrong_image_pairs is None:
+                                raise RuntimeError(
+                                    "counterfactual-bank probe lacks pairing"
+                                )
+                            wrong_image_pair = wrong_image_pairs[sample_position]
+                            wrong_sample = wrong_image_source_data[
+                                wrong_image_pair["source_position"]
+                            ]
+                            target_image = sample["image"].convert("RGB")
+                            wrong_image = resize_wrong_image(
+                                wrong_sample["image"], target_image
+                            )
+                            prompt_row = dict(sample)
+                            prompt_row["image"] = wrong_image
+                            wrong_model_inputs = build_prompt(
+                                prompt_row,
+                                args,
+                                turn_idx=turn_index,
+                                conversation_history=(
+                                    conversation_history
+                                    if turn_index > 0
+                                    else None
+                                ),
+                            )
+                            probe_metadata = (
+                                apply_teacher_forced_counterfactual_bank_probes(
+                                    model.base_model,
+                                    model_inputs,
+                                    wrong_model_inputs,
+                                    output_ids,
+                                    prompt_length=input_len,
+                                    trace=trace,
+                                    wrong_image_pair=wrong_image_pair,
+                                    view_batch_size=args.visual_probe_batch_size,
+                                )
+                            )
+                    else:
+                        probe_metadata = None
                     output_hashes.append(_token_hash(output_ids, input_len))
                     if args.save_token_ids:
                         output_token_ids.append(
@@ -372,6 +564,7 @@ def evaluate(args):
                     acceptance_lengths.append(accepted)
                     if not args.no_policy_trace:
                         policy_traces.append(trace)
+                        selective_probe_metadata.append(probe_metadata)
                     draft_times.append(float(draft_time))
                     target_times.append(float(target_time))
 
@@ -387,15 +580,32 @@ def evaluate(args):
                 }
                 if not args.no_policy_trace:
                     choice["policy_trace"] = policy_traces
+                    if any(
+                        metadata is not None
+                        for metadata in selective_probe_metadata
+                    ):
+                        choice["selective_probe_metadata"] = (
+                            selective_probe_metadata
+                        )
                 if args.save_decoded_output:
                     choice["turns"] = decoded_turns
                 if args.save_token_ids:
                     choice["output_token_ids"] = output_token_ids
                 choices.append(choice)
 
+            sample_metadata = dict(sample)
+            sample_metadata.update(
+                {
+                    "image_cluster_id": str(
+                        sample.get("image_id", sample["id"])
+                    ),
+                    "analysis_split": analysis_split,
+                    "analysis_split_seed": int(args.split_seed),
+                }
+            )
             save_result(
                 answer_files[policy],
-                sample,
+                sample_metadata,
                 f"{args.model_id}-{args.draft_engine}-{policy}",
                 choices,
             )
@@ -548,6 +758,23 @@ def main():
         default=0,
         help="Skip the first N samples in each topic before balanced selection.",
     )
+    parser.add_argument(
+        "--sample-order-seed",
+        type=int,
+        help=(
+            "Shuffle the selected samples with this seed before evaluation; "
+            "omit to retain dataset order."
+        ),
+    )
+    parser.add_argument(
+        "--sample-order-offset",
+        type=int,
+        default=0,
+        help=(
+            "Skip this many samples after the optional deterministic shuffle; "
+            "useful for image-disjoint continuation sets."
+        ),
+    )
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--warmup-tokens", type=int, default=32)
     parser.add_argument(
@@ -557,6 +784,47 @@ def main():
     )
     parser.add_argument("--save-decoded-output", action="store_true")
     parser.add_argument("--save-token-ids", action="store_true")
+    parser.add_argument(
+        "--selective-reuse-diagnostics",
+        action="store_true",
+        help=(
+            "Record four-region counterfactual visual sensitivity and "
+            "U-only/GC-only shadow-tree outcomes without changing decoding."
+        ),
+    )
+    parser.add_argument(
+        "--selective-reuse-probe-mode",
+        choices=(
+            "packed-attention",
+            "teacher-forced-pixel",
+            "teacher-forced-content-ablation",
+            "teacher-forced-counterfactual-bank",
+        ),
+        default="packed-attention",
+        help=(
+            "Use the legacy cached-attention diagnostic or recompute the "
+            "vision encoder under regional or whole-image mean-pixel "
+            "ablation on one text path."
+        ),
+    )
+    parser.add_argument(
+        "--visual-probe-batch-size",
+        type=int,
+        default=1,
+        help="Number of full/masked views evaluated in one diagnostic forward.",
+    )
+    parser.add_argument(
+        "--counterfactual-wrong-image-pool",
+        choices=("full", "selected"),
+        default="full",
+        help=(
+            "Choose wrong-image controls from the full dataset or only the "
+            "selected target set. The latter keeps confirmation controls "
+            "inside a fresh image-disjoint set."
+        ),
+    )
+    parser.add_argument("--discovery-fraction", type=float, default=0.3)
+    parser.add_argument("--split-seed", type=int, default=314159)
     parser.add_argument(
         "--no-policy-trace",
         action="store_true",
@@ -639,11 +907,22 @@ def main():
         args.hst_trace_diagnostics
         or args.verification_trace_diagnostics
         or args.verification_layer_diagnostics
+        or args.selective_reuse_diagnostics
     ):
         parser.error(
             "trace diagnostics require policy traces; remove "
             "--no-policy-trace"
         )
+    if args.selective_reuse_diagnostics and args.draft_engine != "tree-recycling":
+        parser.error(
+            "--selective-reuse-diagnostics requires --draft-engine tree-recycling"
+        )
+    if args.visual_probe_batch_size <= 0:
+        parser.error("--visual-probe-batch-size must be positive")
+    if args.sample_order_offset < 0:
+        parser.error("--sample-order-offset must be non-negative")
+    if not 0.0 < args.discovery_fraction < 1.0:
+        parser.error("--discovery-fraction must lie strictly between 0 and 1")
     args.model = args.base_model_path
     evaluate(args)
 

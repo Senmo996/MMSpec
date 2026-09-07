@@ -280,21 +280,17 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_
 def reset_tree_mode(
         model,
 ):
-    # Handle different model structures:
-    # - Original LLaVA/LLaMA: model.base_model.model
-    # - HF LLaVA (LlavaForConditionalGeneration): model.base_model.language_model.model
-    if hasattr(model.base_model, 'language_model'):
-        # HF LLaVA
-        lang_model = model.base_model.language_model.model
+    # Prefer the wrapper helper because current HF LLaVA exposes LlamaModel
+    # directly while older releases exposed a causal-LM wrapper around it.
+    if hasattr(model, '_get_language_model'):
+        lang_model = model._get_language_model()
+    elif hasattr(model.base_model, 'language_model'):
+        language_model = model.base_model.language_model
+        lang_model = getattr(language_model, 'model', language_model)
     elif hasattr(model.base_model, 'model'):
-        # Original LLaVA/LLaMA
         lang_model = model.base_model.model
     else:
-        # Fallback - try to use the helper method if available
-        if hasattr(model, '_get_language_model'):
-            lang_model = model._get_language_model()
-        else:
-            return  # Can't reset, just return
+        return
     
     lang_model.tree_mask = None
     lang_model.tree_mode = None
@@ -582,6 +578,59 @@ def get_input_embeds_qwen2vl(input_ids, pixel_values, image_grid_thw, model):
 # HF LLaVA Compatible Functions for DynamicCache
 # ============================================================================
 
+
+def cache_sequence_length(past_key_values):
+    if hasattr(past_key_values, "get_seq_length"):
+        return int(past_key_values.get_seq_length())
+    key_cache = getattr(past_key_values, "key_cache", None)
+    if key_cache and key_cache[0] is not None:
+        return int(key_cache[0].shape[-2])
+    return 0
+
+
+def _cache_layer_count(past_key_values):
+    if hasattr(past_key_values, "layers"):
+        return len(past_key_values.layers)
+    return len(getattr(past_key_values, "key_cache", ()))
+
+
+def _cache_layer_tensors(past_key_values, layer_idx):
+    if hasattr(past_key_values, "layers"):
+        layer = past_key_values.layers[layer_idx]
+        if not getattr(layer, "is_initialized", True):
+            return None, None
+        return layer.keys, layer.values
+    return past_key_values.key_cache[layer_idx], past_key_values.value_cache[layer_idx]
+
+
+def _set_cache_layer_tensors(past_key_values, layer_idx, keys, values):
+    if hasattr(past_key_values, "layers"):
+        layer = past_key_values.layers[layer_idx]
+        layer.keys = keys
+        layer.values = values
+    else:
+        past_key_values.key_cache[layer_idx] = keys
+        past_key_values.value_cache[layer_idx] = values
+
+
+def select_cache_sequence(past_key_values, prefix_length, select_indices):
+    """Keep the prefix and selected tree positions in a DynamicCache."""
+    for layer_idx in range(_cache_layer_count(past_key_values)):
+        keys, values = _cache_layer_tensors(past_key_values, layer_idx)
+        if keys is None or values is None:
+            continue
+        layer_select_indices = select_indices.to(keys.device)
+        prefix_keys = keys[..., :prefix_length, :]
+        prefix_values = values[..., :prefix_length, :]
+        selected_keys = keys.index_select(-2, layer_select_indices)
+        selected_values = values.index_select(-2, layer_select_indices.to(values.device))
+        _set_cache_layer_tensors(
+            past_key_values,
+            layer_idx,
+            torch.cat([prefix_keys, selected_keys], dim=-2),
+            torch.cat([prefix_values, selected_values], dim=-2),
+        )
+
 def initialize_tree_hf(input_ids, model, past_key_values, logits_processor, inputs_embeds=None):
     """
     Initialize tree for HF LLaVA using -200 marker mechanism.
@@ -693,7 +742,7 @@ def tree_decoding_hf(
     """
     # For HF LLaVA: use KV cache length for position_ids, not input_ids length
     # input_ids doesn't include expanded image tokens, but KV cache does
-    kv_seq_len = past_key_values.key_cache[0].shape[2] if len(past_key_values.key_cache) > 0 else input_ids.shape[1]
+    kv_seq_len = cache_sequence_length(past_key_values) or input_ids.shape[1]
     position_ids = tree_position_ids + kv_seq_len
     
     if position_ids is not None and position_ids.dim() == 1:
@@ -773,8 +822,8 @@ def update_inference_inputs_hf(
     
     # Derive pre-tree KV length directly from cache state. This is robust across
     # different multimodal tokenization layouts.
-    if len(past_key_values.key_cache) > 0 and past_key_values.key_cache[0] is not None:
-        kv_total_len = past_key_values.key_cache[0].shape[2]
+    kv_total_len = cache_sequence_length(past_key_values)
+    if kv_total_len > 0:
         tree_len = hidden_state_new.shape[1]
         kv_len_before_tree = kv_total_len - tree_len
     else:
@@ -799,24 +848,11 @@ def update_inference_inputs_hf(
     # Update DynamicCache - we need to truncate and keep only accepted tokens
     # The cache currently has all tree tokens, we need to select only the accepted path
     
-    # Truncate cache to keep only accepted tokens
-    for layer_idx in range(len(past_key_values.key_cache)):
-        if past_key_values.key_cache[layer_idx] is not None:
-            key = past_key_values.key_cache[layer_idx]
-            value = past_key_values.value_cache[layer_idx]
-            
-            # Keep original tokens + accepted tree tokens
-            # Use kv_len_before_tree (original KV cache length, not including tree tokens)
-            orig_keys = key[:, :, :kv_len_before_tree, :]
-            orig_values = value[:, :, :kv_len_before_tree, :]
-            
-            # Get accepted tree tokens using select_indices
-            tree_keys = key[:, :, select_indices.to(key.device), :]
-            tree_values = value[:, :, select_indices.to(value.device), :]
-            
-            # Combine
-            past_key_values.key_cache[layer_idx] = torch.cat([orig_keys, tree_keys], dim=2)
-            past_key_values.value_cache[layer_idx] = torch.cat([orig_values, tree_values], dim=2)
+    select_cache_sequence(
+        past_key_values,
+        prefix_length=kv_len_before_tree,
+        select_indices=select_indices,
+    )
     
     # Get accepted hidden states and generate new draft tokens
     retrieve_hidden_state_new = hidden_state_new[:, retrieve_indices]

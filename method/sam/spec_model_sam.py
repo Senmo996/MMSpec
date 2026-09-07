@@ -46,11 +46,6 @@ class SpecModel(nn.Module):
         self.draft = DraftModel(device=base_model.device)
         self.total_tokens = total_token  # Store total_token directly
 
-        if hasattr(base_model, "language_model"):
-            base_model = base_model.language_model
-
-        self.hidden_size = base_model.lm_head.weight.shape[-1]
-        self.vocab_size = base_model.lm_head.weight.shape[0]
         self.base_model_name_or_path = base_model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.base_model_name_or_path, use_fast=False
@@ -244,79 +239,7 @@ class SpecModel(nn.Module):
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
 
-        embed_weights = None
-        special_image_mask = None
         if (
-            self.base_model.config.architectures[0]
-            == "LlavaNextForConditionalGeneration"
-        ):
-            image_token_id = self.base_model.config.image_token_index
-            vision_feature_layer = kwargs.get("vision_feature_layer")
-            vision_feature_select_strategy = kwargs.get(
-                "vision_feature_select_strategy"
-            )
-            pixel_values = kwargs.get("pixel_values")
-            image_sizes = kwargs.get("image_sizes")
-
-            vision_feature_layer = (
-                vision_feature_layer
-                if vision_feature_layer is not None
-                else self.base_model.config.vision_feature_layer
-            )
-            vision_feature_select_strategy = (
-                vision_feature_select_strategy
-                if vision_feature_select_strategy is not None
-                else self.base_model.config.vision_feature_select_strategy
-            )
-
-            if pixel_values is not None and inputs_embeds is not None:
-                raise ValueError(
-                    "You cannot specify both pixel_values and inputs_embeds at the same time, and must specify either one"
-                )
-
-            if inputs_embeds is None:
-                inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
-
-            if pixel_values is not None and pixel_values.size(0) > 0:
-                image_features = self.base_model.get_image_features(
-                    pixel_values,
-                    image_sizes,
-                    vision_feature_layer=vision_feature_layer,
-                    vision_feature_select_strategy=vision_feature_select_strategy,
-                )
-
-                # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
-                image_features, feature_lens = self.base_model.pack_image_features(
-                    image_features,
-                    image_sizes,
-                    vision_feature_select_strategy=vision_feature_select_strategy,
-                    image_newline=self.base_model.image_newline,
-                )
-
-                special_image_mask = (
-                    input_ids == image_token_id
-                ).unsqueeze(-1)
-                special_image_mask = special_image_mask.expand_as(inputs_embeds).to(
-                    inputs_embeds.device
-                )
-                if inputs_embeds[special_image_mask].numel() != image_features.numel():
-                    n_image_tokens = (
-                        input_ids == image_token_id
-                    ).sum()
-                    n_image_features = image_features.shape[0]
-                    raise ValueError(
-                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-                    )
-                image_features = image_features.to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
-                inputs_embeds = inputs_embeds.masked_scatter(
-                    special_image_mask, image_features
-                )
-
-                # special_image_mask = special_image_mask[..., 0]
-
-        elif (
             self.base_model.config.architectures[0]
             == "Qwen2_5_VLForConditionalGeneration"
         ):

@@ -15,6 +15,7 @@ from .controller import (
     confidence_from_logits,
 )
 from .counterfactual_probes import (
+    build_counterfactual_attention_mask,
     build_tree_counterfactual_attention_mask,
     build_visual_probe_layout,
     cover_candidates,
@@ -27,8 +28,23 @@ from .hidden_state_transport import (
     SOURCE_SCOPES,
     TRANSPORT_MODES,
 )
-from .spec_model import SpecModel as _GroundedSamSpecModel
-from .visual_lexical_inventory import rank_scores
+from .spec_model import (
+    SUPPORTED_MULTIMODAL_ARCHITECTURES,
+    SpecModel as _GroundedSamSpecModel,
+    resolve_generation_max_length,
+    resolve_image_token_id,
+)
+from .visual_lexical_inventory import fuse_equal_budget_candidates, rank_scores
+
+
+SELECTIVE_REUSE_PROBE_MODES = frozenset(
+    {
+        "packed-attention",
+        "teacher-forced-pixel",
+        "teacher-forced-content-ablation",
+        "teacher-forced-counterfactual-bank",
+    }
+)
 
 
 TRIGRAM_PLUS4_NODE_BUDGETS = {
@@ -98,6 +114,30 @@ PERSISTENT_OPTIMIZED_DEPTH_CONFIGS = {
     "hotpath-cpp-depth10-node63-wide-plus4": (63, 10),
 }
 
+MATCHED_BUDGET_CONTROL_CONFIGS = {
+    "fixed-depth10-node63-wide8": (8, 10, 63),
+    "score-prior-depth10-node63-wide8": (8, 10, 63),
+    "context-score-trigram-strict-depth10-node63-wide8": (8, 10, 63),
+    "context-score-trigram-fusion-uniform-depth10-node63-wide8": (
+        8,
+        10,
+        63,
+    ),
+    "context-score-trigram-fusion-depth10-node63-wide8": (8, 10, 63),
+    "context-score-trigram-fusion-persistent-depth10-node63-wide8": (
+        8,
+        10,
+        63,
+    ),
+}
+MATCHED_BUDGET_CONTROL_CONFIGS.update(
+    {
+        f"{allocator}-depth10-node{budget}-wide8": (8, 10, budget)
+        for allocator in ("fixed", "score-prior")
+        for budget in (31, 47, 63, 79, 95)
+    }
+)
+
 CONTEXT_PLUS4_SPECIAL_POLICIES = frozenset(
     TRIGRAM_PLUS4_NODE_BUDGETS
 ) | frozenset(PERSISTENT_FUSION_NODE_BUDGETS) | frozenset(
@@ -111,6 +151,9 @@ CONTEXT_PLUS4_SPECIAL_POLICIES |= frozenset(
 )
 CONTEXT_PLUS4_SPECIAL_POLICIES |= frozenset(
     PERSISTENT_OPTIMIZED_DEPTH_CONFIGS
+)
+CONTEXT_PLUS4_SPECIAL_POLICIES |= frozenset(
+    MATCHED_BUDGET_CONTROL_CONFIGS
 )
 
 GLOBAL_BACKOFF_POLICIES = {
@@ -425,6 +468,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 broad_width + 4,
                 PERSISTENT_OPTIMIZED_DEPTH_CONFIGS[policy][1],
             )
+        if policy in MATCHED_BUDGET_CONTROL_CONFIGS:
+            width, depth, _ = MATCHED_BUDGET_CONTROL_CONFIGS[policy]
+            return width, depth
         context_width_augmentation = {
             "context-score-prior-deeper-wide-plus4": 4,
             "context-score-trigram-deeper-wide-plus4": 4,
@@ -618,6 +664,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             return min(
                 budget, PERSISTENT_OPTIMIZED_DEPTH_CONFIGS[policy][0]
             )
+        if policy in MATCHED_BUDGET_CONTROL_CONFIGS:
+            return min(budget, MATCHED_BUDGET_CONTROL_CONFIGS[policy][2])
         if policy == "context-score-prior-deeper-wide-plus2-node55":
             return min(budget, 55)
         if policy == "context-score-prior-deeper-wide-plus2-node47":
@@ -1162,7 +1210,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     total = sum(selected_scores) or 1.0
                     return selected, [score / total for score in selected_scores]
                 if context_candidate_mode.startswith("fusion"):
-                    if context_candidate_mode == "fusion55":
+                    if context_candidate_mode == "fusion_uniform":
+                        source_weights = (1.0, 1.0, 1.0, 1.0)
+                    elif context_candidate_mode == "fusion55":
                         source_weights = (0.55, 0.30, 0.15, 0.05)
                     elif context_candidate_mode == "fusion_adaptive":
                         primary_top_probability = (
@@ -1668,6 +1718,13 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             metadata_out["node_ranks"] = [0] + [
                 int(node["rank"]) for node in nodes
             ]
+            if metadata_out.get("_candidate_trace_diagnostics", False):
+                metadata_out["node_parents"] = [
+                    int(node["parent"]) for node in nodes
+                ]
+                metadata_out["node_depths"] = [
+                    int(node["depth"]) for node in nodes
+                ]
             semantic_previous_tokens = [
                 root_previous_token,
                 *[
@@ -1715,6 +1772,50 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 accepted_path, start=1
             )
         )
+
+    @staticmethod
+    def _tree_path_token_ids(flat_tokens, paths):
+        """Materialize compact token paths from a packed-tree topology."""
+
+        return [
+            [int(flat_tokens[node_index]) for node_index in path]
+            for path in paths
+        ]
+
+    @staticmethod
+    def _longest_matching_path(path_token_ids, future_token_ids) -> int:
+        """Return the longest tree-path prefix matching a realized continuation."""
+
+        future = [int(token) for token in future_token_ids]
+        best = 0
+        for path in path_token_ids:
+            matched = 0
+            for candidate, target in zip(path, future):
+                if int(candidate) != target:
+                    break
+                matched += 1
+            best = max(best, matched)
+        return int(best)
+
+    @staticmethod
+    def _visual_probe_metrics(view_logits: torch.Tensor, top_k: int):
+        """Summarize full-view versus spatially masked next-token logits."""
+
+        if view_logits.ndim != 2 or int(view_logits.shape[0]) < 2:
+            raise ValueError(
+                "view_logits must contain one full and at least one masked view"
+            )
+        top1 = torch.argmax(view_logits, dim=-1)
+        disagreement = top1[1:].ne(top1[0]).float().mean()
+        return {
+            "visual_probe_jsd": float(multiview_jsd(view_logits)),
+            "visual_probe_topk_union_size": int(
+                topk_union_size(view_logits, top_k)
+            ),
+            "visual_probe_top1_disagreement_rate": float(
+                disagreement.item()
+            ),
+        }
 
     @staticmethod
     def _best_verified_path(
@@ -1833,6 +1934,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         verification_margin_threshold=0.0,
         verification_compact_path_repair=False,
         verification_compact_root_margin_threshold=0.0,
+        candidate_trace_diagnostics=False,
+        selective_reuse_diagnostics=False,
+        selective_reuse_probe_mode="packed-attention",
         visual_cache_key=None,
         return_policy_trace=False,
         disable_repeat_guard=True,
@@ -1847,6 +1951,23 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             raise NotImplementedError("Tree Recycling pilot currently supports greedy decoding")
 
         requested_draft_policy = str(draft_policy)
+        collect_candidate_trace = bool(
+            return_policy_trace and candidate_trace_diagnostics
+        )
+        collect_selective_reuse = bool(
+            return_policy_trace and selective_reuse_diagnostics
+        )
+        selective_reuse_probe_mode = str(selective_reuse_probe_mode)
+        if selective_reuse_probe_mode not in SELECTIVE_REUSE_PROBE_MODES:
+            raise ValueError(
+                "selective_reuse_probe_mode must be packed-attention, "
+                "teacher-forced-pixel, teacher-forced-content-ablation, or "
+                "teacher-forced-counterfactual-bank"
+            )
+        packed_selective_reuse_probes = bool(
+            collect_selective_reuse
+            and selective_reuse_probe_mode == "packed-attention"
+        )
         cover_enabled = requested_draft_policy.startswith("cover-")
         if cover_enabled:
             draft_policy = requested_draft_policy[len("cover-") :]
@@ -1989,6 +2110,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         grounding_free_policies.update(PERSISTENT_DEPTH_NODE_CONFIGS)
         grounding_free_policies.update(PERSISTENT_ADAPTIVE_DEPTH_POLICIES)
         grounding_free_policies.update(PERSISTENT_OPTIMIZED_DEPTH_CONFIGS)
+        grounding_free_policies.update(MATCHED_BUDGET_CONTROL_CONFIGS)
         need_grounding = bool(
             cover_enabled or draft_policy not in grounding_free_policies
         )
@@ -2018,7 +2140,17 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         )
         stop_token_ids = _collect_stop_token_ids(self.tokenizer, self.base_model)
         prompt_length = int(input_ids.shape[1])
-        max_length = min(int(max_length), prompt_length + int(max_new_tokens))
+        arch = self.base_model.config.architectures[0]
+        if arch not in SUPPORTED_MULTIMODAL_ARCHITECTURES:
+            raise NotImplementedError(
+                f"Tree Recycling does not support architecture {arch}"
+            )
+        max_length = resolve_generation_max_length(
+            self.base_model.config,
+            prompt_length,
+            max_new_tokens,
+            max_length,
+        )
         tree_fixed_width = max(int(tree_fixed_width), 1)
         tree_fixed_depth = max(int(tree_fixed_depth), 1)
         tree_broad_width = max(int(tree_broad_width), 1)
@@ -2133,21 +2265,23 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             self.tree_recycling_past_key_values_data = past_key_values_data
             self.tree_recycling_current_length_data = current_length_data
 
-        if self.base_model.config.architectures[0] != "Qwen2_5_VLForConditionalGeneration":
-            raise NotImplementedError("Tree Recycling pilot currently targets Qwen2.5-VL")
-        image_token_id = self.base_model.config.image_token_id
+        image_token_id = resolve_image_token_id(self.base_model.config)
         visual_mask = self._build_visual_token_mask(input_ids).detach()
         pixel_values = kwargs.get("pixel_values")
         image_grid_thw = kwargs.get("image_grid_thw")
-        cover_layout = None
-        if cover_enabled:
-            cover_layout = build_visual_probe_layout(
+        visual_probe_layout = None
+        if cover_enabled or packed_selective_reuse_probes:
+            if arch != "Qwen2_5_VLForConditionalGeneration":
+                raise NotImplementedError(
+                    "Counterfactual visual probes currently require Qwen2.5-VL"
+                )
+            visual_probe_layout = build_visual_probe_layout(
                 visual_mask,
                 image_grid_thw,
                 int(self.base_model.config.vision_config.spatial_merge_size),
                 cover_num_probes,
             )
-        if inputs_embeds is None:
+        if arch == "Qwen2_5_VLForConditionalGeneration" and inputs_embeds is None:
             inputs_embeds = self.base_model.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 cached_visual = getattr(
@@ -2270,14 +2404,28 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             need_confidence=need_confidence,
         )
         visual_lexical_inventory: List[int] = []
+        # Selective-reuse diagnostics use a genuinely image-conditioned
+        # proposal source.  Keep it separate from the deployable VLI policies
+        # so collecting the diagnostic cannot change the decoded tree.
+        selective_visual_inventory: List[int] = []
         excluded_token_ids = set(int(token) for token in self.tokenizer.all_special_ids)
-        for attribute in ("image_token_id", "video_token_id"):
+        for attribute in ("image_token_id", "image_token_index", "video_token_id"):
             token_id = getattr(self.base_model.config, attribute, None)
             if token_id is not None:
                 excluded_token_ids.add(int(token_id))
         if visual_lexical_enabled and bool(visual_mask.any().item()):
             visual_scores = init_output.logits[0, visual_mask].max(dim=0).values
             visual_lexical_inventory = rank_scores(
+                visual_scores,
+                visual_lexical_pool_size,
+                excluded_token_ids=sorted(excluded_token_ids),
+                valid_vocab_size=min(
+                    len(self.tokenizer), int(init_output.logits.shape[-1])
+                ),
+            )
+        if collect_selective_reuse and bool(visual_mask.any().item()):
+            visual_scores = init_output.logits[0, visual_mask].max(dim=0).values
+            selective_visual_inventory = rank_scores(
                 visual_scores,
                 visual_lexical_pool_size,
                 excluded_token_ids=sorted(excluded_token_ids),
@@ -2462,6 +2610,24 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         )
         persistent_trigram_size_at_start = (
             len(host_trigram_transitions) if use_persistent_ngram else 0
+        )
+        candidate_trace_persistent_keys_at_start = (
+            set(host_transitions)
+            if (collect_candidate_trace or collect_selective_reuse)
+            and use_persistent_unigram
+            and host_transitions is not None
+            else set()
+        )
+        selective_u_top_probabilities_at_start = (
+            {
+                int(token): float(scores[0])
+                for token, scores in host_transition_scores.items()
+                if scores
+            }
+            if collect_selective_reuse
+            and use_persistent_unigram
+            and host_transition_scores is not None
+            else {}
         )
         global_candidate_counts = {} if use_global_backoff else None
         global_candidate_ids = []
@@ -3171,12 +3337,20 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             next_token,
                         )
             tree_metadata = (
-                {}
-                if verification_trace_diagnostics or use_context_transitions
+                {
+                    "_candidate_trace_diagnostics": bool(
+                        collect_candidate_trace
+                    )
+                }
+                if verification_trace_diagnostics
+                or use_context_transitions
+                or collect_candidate_trace
                 else None
             )
             if "-trigram-residual2-" in draft_policy:
                 context_candidate_mode = "residual2"
+            elif "-trigram-fusion-uniform-" in draft_policy:
+                context_candidate_mode = "fusion_uniform"
             elif "-trigram-fusion55-" in draft_policy:
                 context_candidate_mode = "fusion55"
             elif "-trigram-fusion-adaptive-" in draft_policy:
@@ -3257,11 +3431,212 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 ),
             )
             num_nodes = len(flat_tokens) - 1
+            selective_u_paths = []
+            selective_gc_paths = []
+            selective_u_root_candidates = []
+            selective_gc_root_candidates = []
+            selective_v_root_candidates = []
+            selective_uv_root_candidates = []
+            selective_u_source_available = False
+            selective_u_available_before_request = False
+            selective_u_row_top_probability_before_request = None
+            selective_u_row_top_probability = None
+            selective_u_persistent_row_top_probability = None
+            selective_g_source_available = False
+            selective_c_source_available = False
+            selective_v_source_available = False
+            selective_u_node_count = 0
+            selective_gc_node_count = 0
+            selective_uv_candidate_budget = 0
+            selective_uv_added_candidate = None
+            selective_uv_displaced_candidate = None
+            if collect_selective_reuse:
+                persistent_u_rows = (
+                    persistent_shadow_transitions
+                    if persistent_shadow_transitions is not None
+                    else persistent_bank_transitions
+                )
+                persistent_u_scores = (
+                    persistent_shadow_scores
+                    if persistent_shadow_scores is not None
+                    else persistent_bank_scores
+                )
+                selective_u_source_available = bool(
+                    (host_transitions is not None and root_token in host_transitions)
+                    or (
+                        persistent_u_rows is not None
+                        and root_token in persistent_u_rows
+                    )
+                )
+                selective_u_available_before_request = bool(
+                    root_token in candidate_trace_persistent_keys_at_start
+                )
+                selective_u_row_top_probability_before_request = (
+                    selective_u_top_probabilities_at_start.get(root_token)
+                )
+                if (
+                    host_transition_scores is not None
+                    and root_token in host_transition_scores
+                    and host_transition_scores[root_token]
+                ):
+                    selective_u_row_top_probability = float(
+                        host_transition_scores[root_token][0]
+                    )
+                if (
+                    persistent_u_scores is not None
+                    and root_token in persistent_u_scores
+                    and persistent_u_scores[root_token]
+                ):
+                    selective_u_persistent_row_top_probability = float(
+                        persistent_u_scores[root_token][0]
+                    )
+                selective_g_source_available = bool(
+                    host_trigram_transitions is not None
+                    and root_trigram_key is not None
+                    and root_trigram_key in host_trigram_transitions
+                )
+                selective_c_source_available = bool(
+                    host_context_transitions is not None
+                    and root_context_key is not None
+                    and root_context_key in host_context_transitions
+                )
+                selective_v_source_available = bool(selective_visual_inventory)
+
+                def build_source_shadow(
+                    *,
+                    unigram_rows,
+                    unigram_scores,
+                    persistent_rows=None,
+                    persistent_scores=None,
+                    context_rows=None,
+                    context_scores=None,
+                    trigram_rows=None,
+                    trigram_scores=None,
+                ):
+                    shadow_flat, _, _, shadow_paths = self._build_tree(
+                        root_token,
+                        transitions,
+                        transition_valid,
+                        width,
+                        effective_tree_depth,
+                        effective_tree_node_budget,
+                        image_token_id,
+                        branch_width=branch_width,
+                        transition_bin=transition_bin,
+                        fallback_transition_bin=fallback_transition_bin,
+                        transition_counts=transition_counts,
+                        preserve_fallback_limit=(
+                            tree_broad_width if use_grounded_residual else 0
+                        ),
+                        topology_cache=topology_cache,
+                        host_transitions=unigram_rows,
+                        host_transition_scores=unigram_scores,
+                        root_previous_token=root_previous_token,
+                        root_previous_previous_token=(
+                            root_previous_previous_token
+                        ),
+                        root_previous_previous_previous_token=(
+                            root_previous_previous_previous_token
+                        ),
+                        host_context_transitions=context_rows,
+                        host_context_transition_scores=context_scores,
+                        host_trigram_transitions=trigram_rows,
+                        host_trigram_transition_scores=trigram_scores,
+                        host_persistent_transitions=persistent_rows,
+                        host_persistent_transition_scores=persistent_scores,
+                        context_candidate_mode=context_candidate_mode,
+                        priority_layout=draft_policy.startswith("rank-prior-"),
+                        score_priority_layout=use_score_priority,
+                        score_hit_masses=self._score_priority_hit_masses(
+                            draft_policy,
+                            root_transition_context_order,
+                        ),
+                        copy_candidate_rows=True,
+                        fast_score_priority_layout=False,
+                    )
+                    root_candidates = []
+                    seen_root_candidates = set()
+                    for path in shadow_paths:
+                        if not path:
+                            continue
+                        candidate = int(shadow_flat[path[0]])
+                        if candidate in seen_root_candidates:
+                            continue
+                        seen_root_candidates.add(candidate)
+                        root_candidates.append(candidate)
+                        if len(root_candidates) >= 8:
+                            break
+                    return (
+                        self._tree_path_token_ids(shadow_flat, shadow_paths),
+                        root_candidates,
+                        len(shadow_flat) - 1,
+                    )
+
+                (
+                    selective_u_paths,
+                    selective_u_root_candidates,
+                    selective_u_node_count,
+                ) = build_source_shadow(
+                    unigram_rows=host_transitions,
+                    unigram_scores=host_transition_scores,
+                    persistent_rows=persistent_u_rows,
+                    persistent_scores=persistent_u_scores,
+                )
+                (
+                    selective_gc_paths,
+                    selective_gc_root_candidates,
+                    selective_gc_node_count,
+                ) = build_source_shadow(
+                    # A non-None empty table selects the host-table path while
+                    # deliberately removing the unigram source.
+                    unigram_rows={},
+                    unigram_scores={},
+                    context_rows=host_context_transitions,
+                    context_scores=host_context_transition_scores,
+                    trigram_rows=host_trigram_transitions,
+                    trigram_scores=host_trigram_transition_scores,
+                )
+                selective_v_root_candidates = selective_visual_inventory[:8]
+                # Freeze a one-slot visual injection at an exactly matched
+                # root-candidate budget.  This shadow candidate row is never
+                # used by the live decoder.
+                selective_uv_candidate_budget = min(
+                    8, len(selective_u_root_candidates)
+                )
+                if selective_uv_candidate_budget > 0:
+                    selective_uv_root_candidates = fuse_equal_budget_candidates(
+                        selective_u_root_candidates,
+                        selective_visual_inventory,
+                        budget=selective_uv_candidate_budget,
+                        inventory_slots=1,
+                    )
+                    added = [
+                        token
+                        for token in selective_uv_root_candidates
+                        if token not in selective_u_root_candidates
+                    ]
+                    displaced = [
+                        token
+                        for token in selective_u_root_candidates[
+                            :selective_uv_candidate_budget
+                        ]
+                        if token not in selective_uv_root_candidates
+                    ]
+                    selective_uv_added_candidate = added[0] if added else None
+                    selective_uv_displaced_candidate = (
+                        displaced[0] if displaced else None
+                    )
             cover_probe_active = bool(
                 cover_enabled
                 and grounding_score >= cover_probe_visual_threshold
                 and num_nodes > 0
                 and remaining > 1
+            )
+            selective_probe_active = bool(
+                packed_selective_reuse_probes and remaining > 0
+            )
+            packed_probe_active = bool(
+                cover_probe_active or selective_probe_active
             )
             max_path_depth = max((len(path) for path in paths), default=0)
             used_path_depth = min(max_path_depth, max(remaining - 1, 0))
@@ -3271,6 +3646,15 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 "requested_draft_policy": requested_draft_policy,
                 "cover_enabled": bool(cover_enabled),
                 "cover_probe_active": cover_probe_active,
+                "selective_reuse_diagnostics": bool(
+                    collect_selective_reuse
+                ),
+                "selective_reuse_probe_mode": (
+                    selective_reuse_probe_mode
+                    if collect_selective_reuse
+                    else None
+                ),
+                "visual_probe_active": packed_probe_active,
                 "cover_probe_visual_threshold": cover_probe_visual_threshold,
                 "cover_min_jsd": cover_min_jsd,
                 "tree_width": int(width),
@@ -3283,13 +3667,13 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 ),
                 "verified_probe_nodes": int(
                     cover_num_probes
-                    if cover_probe_active
+                    if packed_probe_active
                     else 0
                 ),
                 "verified_tree_nodes": int(
                     (
                         num_nodes
-                        + (cover_num_probes if cover_probe_active else 0)
+                        + (cover_num_probes if packed_probe_active else 0)
                     )
                     if num_nodes > 0 and remaining > 1
                     else 0
@@ -3441,18 +3825,254 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 "verification_compact_path_repair": False,
                 "verification_compact_root_recheck": False,
             } if collect_policy_trace else {})
+            if collect_selective_reuse:
+                record.update(
+                    {
+                        "selective_source_top_k": 8,
+                        "selective_generated_offset": int(generated),
+                        "selective_u_source_available": bool(
+                            selective_u_source_available
+                        ),
+                        "selective_u_available_before_request": bool(
+                            selective_u_available_before_request
+                        ),
+                        "selective_u_row_top_probability_before_request": (
+                            selective_u_row_top_probability_before_request
+                        ),
+                        "selective_u_row_top_probability": (
+                            selective_u_row_top_probability
+                        ),
+                        "selective_u_persistent_row_top_probability": (
+                            selective_u_persistent_row_top_probability
+                        ),
+                        "selective_g_source_available": bool(
+                            selective_g_source_available
+                        ),
+                        "selective_c_source_available": bool(
+                            selective_c_source_available
+                        ),
+                        "selective_gc_source_available": bool(
+                            selective_g_source_available
+                            or selective_c_source_available
+                        ),
+                        "selective_u_root_candidate_token_ids": (
+                            selective_u_root_candidates
+                        ),
+                        "selective_gc_root_candidate_token_ids": (
+                            selective_gc_root_candidates
+                        ),
+                        "selective_v_source": "prompt_visual_max",
+                        "selective_v_source_available": bool(
+                            selective_v_source_available
+                        ),
+                        "selective_v_root_candidate_token_ids": (
+                            selective_v_root_candidates
+                        ),
+                        "selective_uv_root_candidate_token_ids": (
+                            selective_uv_root_candidates
+                        ),
+                        "selective_uv_candidate_budget": int(
+                            selective_uv_candidate_budget
+                        ),
+                        "selective_uv_visual_slots": 1,
+                        "selective_uv_added_candidate_token_id": (
+                            selective_uv_added_candidate
+                        ),
+                        "selective_uv_displaced_candidate_token_id": (
+                            selective_uv_displaced_candidate
+                        ),
+                        "selective_u_tree_nodes": int(
+                            selective_u_node_count
+                        ),
+                        "selective_gc_tree_nodes": int(
+                            selective_gc_node_count
+                        ),
+                        "_selective_u_path_token_ids": selective_u_paths,
+                        "_selective_gc_path_token_ids": selective_gc_paths,
+                    }
+                )
+            if collect_candidate_trace:
+                root_source_candidate_token_ids = {}
+                root_source_candidate_scores = {}
+
+                def add_root_source(name, rows, scores, key):
+                    if rows is None or key is None or key not in rows:
+                        return
+                    root_source_candidate_token_ids[name] = [
+                        int(token) for token in rows[key]
+                    ]
+                    if scores is not None and key in scores:
+                        root_source_candidate_scores[name] = [
+                            float(score) for score in scores[key]
+                        ]
+
+                add_root_source(
+                    "G",
+                    host_trigram_transitions,
+                    host_trigram_transition_scores,
+                    root_trigram_key,
+                )
+                add_root_source(
+                    "C",
+                    host_context_transitions,
+                    host_context_transition_scores,
+                    root_context_key,
+                )
+                add_root_source(
+                    "U",
+                    host_transitions,
+                    host_transition_scores,
+                    root_token,
+                )
+                add_root_source(
+                    "persistent_U_bank",
+                    persistent_bank_transitions,
+                    persistent_bank_scores,
+                    root_token,
+                )
+
+                node_parents = list(tree_metadata.get("node_parents", []))
+                parent_indices = {int(parent) for parent in node_parents}
+                leaf_indices = [
+                    node_index
+                    for node_index in range(1, len(flat_tokens))
+                    if node_index not in parent_indices
+                ]
+                leaf_paths = [
+                    paths[node_index - 1] for node_index in leaf_indices
+                ]
+                record.update(
+                    {
+                        "root_token_id": int(root_token),
+                        "root_context_token_ids": [
+                            int(token)
+                            for token in (
+                                root_previous_previous_token,
+                                root_previous_token,
+                                root_token,
+                            )
+                            if token is not None
+                        ],
+                        "generated_prefix_tail_token_ids": [
+                            int(token)
+                            for token in input_ids[
+                                0, max(prompt_length, input_ids.shape[1] - 16) :
+                            ].tolist()
+                        ],
+                        "root_source_candidate_token_ids": (
+                            root_source_candidate_token_ids
+                        ),
+                        "root_source_candidate_scores": (
+                            root_source_candidate_scores
+                        ),
+                        "root_u_available_before_request": bool(
+                            root_token
+                            in candidate_trace_persistent_keys_at_start
+                        ),
+                        "fused_root_candidate_token_ids": [
+                            int(flat_tokens[node_index])
+                            for node_index, parent_index in enumerate(
+                                node_parents, start=1
+                            )
+                            if int(parent_index) == 0
+                        ],
+                        "candidate_tree_token_ids": [
+                            int(token) for token in flat_tokens
+                        ],
+                        "candidate_tree_parent_indices": [
+                            -1,
+                            *[int(parent) for parent in node_parents],
+                        ],
+                        "candidate_tree_depths": [
+                            0,
+                            *[
+                                int(node_depth)
+                                for node_depth in tree_metadata.get(
+                                    "node_depths", []
+                                )
+                            ],
+                        ],
+                        "candidate_tree_ranks": [
+                            int(rank)
+                            for rank in tree_metadata.get("node_ranks", [])
+                        ],
+                        "candidate_leaf_path_token_ids": [
+                            [
+                                int(flat_tokens[node_index])
+                                for node_index in path
+                            ]
+                            for path in leaf_paths
+                        ],
+                        "suffix_candidate_token_ids": [
+                            int(token) for token in sam_draft_tokens
+                        ],
+                    }
+                )
             if collect_policy_trace and not trace and calibrator is not None:
                 record["grounding_calibration"] = calibrator.diagnostics()
 
             if num_nodes == 0 or remaining <= 1:
-                output = self.base_model(
-                    input_ids=input_ids[:, -1:],
-                    past_key_values=past_key_values,
-                    return_dict=True,
-                    use_cache=True,
-                    output_hidden_states=need_all_hidden_states,
-                    output_last_hidden_state=need_hidden_states,
-                )
+                root_input = input_ids[:, -1:]
+                if selective_probe_active:
+                    kv_base_len = int(current_length_data[0].item())
+                    verifier_input = root_input.expand(
+                        1, cover_num_probes + 1
+                    )
+                    probe_attention_mask = build_counterfactual_attention_mask(
+                        kv_base_len,
+                        visual_probe_layout,
+                        self.base_model.dtype,
+                        input_ids.device,
+                    )
+                    position_ids = torch.full(
+                        (cover_num_probes + 1,),
+                        kv_base_len,
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                    position_ids = (
+                        position_ids.unsqueeze(0) + self.base_model.rope_deltas
+                    )
+                    position_ids = position_ids.unsqueeze(0).expand(
+                        3, -1, -1
+                    )
+                    output = self.base_model(
+                        input_ids=verifier_input,
+                        attention_mask=probe_attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        return_dict=True,
+                        use_cache=True,
+                        output_hidden_states=need_all_hidden_states,
+                        output_last_hidden_state=need_hidden_states,
+                    )
+                    record.update(
+                        self._visual_probe_metrics(
+                            output.logits[0], matrix_top_k
+                        )
+                    )
+                    record.update(
+                        {
+                            "visual_probe_num_regions": int(
+                                cover_num_probes
+                            ),
+                            "visual_probe_num_visual_tokens": int(
+                                visual_probe_layout.num_visual_tokens
+                            ),
+                            "visual_probe_used_grid_metadata": bool(
+                                visual_probe_layout.used_grid_metadata
+                            ),
+                        }
+                    )
+                else:
+                    output = self.base_model(
+                        input_ids=root_input,
+                        past_key_values=past_key_values,
+                        return_dict=True,
+                        use_cache=True,
+                        output_hidden_states=need_all_hidden_states,
+                        output_last_hidden_state=need_hidden_states,
+                    )
                 store_transitions(
                     output,
                     input_ids[0, -1:],
@@ -3471,11 +4091,11 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     if use_fourgram_transitions
                     else None,
                 )
-                next_id = torch.argmax(output.logits[:, -1, :], dim=-1)
+                next_id = torch.argmax(output.logits[:, 0, :], dim=-1)
                 input_ids = torch.cat([input_ids, next_id[:, None]], dim=1)
                 if verification_trace_diagnostics:
                     top = torch.topk(
-                        output.logits[0, -1].float(), k=2
+                        output.logits[0, 0].float(), k=2
                     )
                     top_values = top.values
                     record.update(
@@ -3499,6 +4119,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     self.draft.update_tokens(next_id.tolist())
                 current_length_data.fill_(input_ids.shape[1] - 1)
                 accepted_path = []
+                accepted_tokens = []
+                correction = int(next_id.item())
                 accept_len = 0
                 query_index = 0
             else:
@@ -3508,8 +4130,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 )
                 verifier_input = tree_input
                 verifier_positions = tree_positions
-                cover_attention_mask = None
-                if cover_probe_active:
+                probe_attention_mask = None
+                if packed_probe_active:
                     probe_input = torch.full(
                         (1, cover_num_probes),
                         root_token,
@@ -3527,20 +4149,25 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             ),
                         ]
                     )
-                    cover_attention_mask = build_tree_counterfactual_attention_mask(
+                    probe_attention_mask = build_tree_counterfactual_attention_mask(
                         kv_base_len,
                         tree_mask,
-                        cover_layout,
+                        visual_probe_layout,
                         self.base_model.dtype,
                         input_ids.device,
                     )
                 position_ids = verifier_positions + kv_base_len
-                position_ids = position_ids.unsqueeze(0) + self.base_model.rope_deltas
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-                if cover_probe_active:
+                if arch == "Qwen2_5_VLForConditionalGeneration":
+                    position_ids = (
+                        position_ids.unsqueeze(0) + self.base_model.rope_deltas
+                    )
+                    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                else:
+                    position_ids = position_ids.unsqueeze(0)
+                if packed_probe_active:
                     output = self.base_model(
                         input_ids=verifier_input,
-                        attention_mask=cover_attention_mask,
+                        attention_mask=probe_attention_mask,
                         position_ids=position_ids,
                         past_key_values=past_key_values,
                         return_dict=True,
@@ -3552,7 +4179,14 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                         output_last_hidden_state=need_hidden_states,
                     )
                 else:
-                    self.base_model.model.tree_mask = tree_mask
+                    if hasattr(self.base_model, "language_model"):
+                        language_model = self.base_model.language_model
+                        tree_mask_model = getattr(
+                            language_model, "model", language_model
+                        )
+                    else:
+                        tree_mask_model = self.base_model.model
+                    tree_mask_model.tree_mask = tree_mask
                     try:
                         output = self.base_model(
                             input_ids=verifier_input,
@@ -3567,7 +4201,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             output_last_hidden_state=need_hidden_states,
                         )
                     finally:
-                        self.base_model.model.tree_mask = None
+                        tree_mask_model.tree_mask = None
 
                 queued_predictions = (
                     torch.argmax(
@@ -3601,28 +4235,47 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             else None
                         ),
                     )
-                if cover_probe_active:
+                if packed_probe_active:
                     actual_tree_length = int(tree_input.shape[1])
-                    cover_view_logits = torch.cat(
+                    visual_probe_logits = torch.cat(
                         [
                             output.logits[0, :1],
                             output.logits[0, actual_tree_length:],
                         ],
                         dim=0,
                     )
+                    record.update(
+                        self._visual_probe_metrics(
+                            visual_probe_logits, matrix_top_k
+                        )
+                    )
+                    record.update(
+                        {
+                            "visual_probe_num_regions": int(
+                                cover_num_probes
+                            ),
+                            "visual_probe_num_visual_tokens": int(
+                                visual_probe_layout.num_visual_tokens
+                            ),
+                            "visual_probe_used_grid_metadata": bool(
+                                visual_probe_layout.used_grid_metadata
+                            ),
+                        }
+                    )
+                if cover_probe_active:
                     previous_row = transitions[
                         transition_bin, root_token
                     ].clone()
                     recycled = torch.tensor(
                         cover_candidates(
-                            cover_view_logits,
+                            visual_probe_logits,
                             matrix_top_k,
                             anchor_fraction=cover_anchor_fraction,
                         ),
                         dtype=transitions.dtype,
                         device=transitions.device,
                     )
-                    view_jsd = multiview_jsd(cover_view_logits)
+                    view_jsd = multiview_jsd(visual_probe_logits)
                     recycle_applied = view_jsd >= cover_min_jsd
                     if recycle_applied:
                         transitions[transition_bin, root_token].copy_(recycled)
@@ -3633,7 +4286,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             "cover_anchor_fraction": cover_anchor_fraction,
                             "cover_view_jsd": view_jsd,
                             "cover_topk_union_size": topk_union_size(
-                                cover_view_logits, matrix_top_k
+                                visual_probe_logits, matrix_top_k
                             ),
                             "cover_recycle_applied": recycle_applied,
                             "cover_candidate_row_changed": recycle_applied
@@ -4075,6 +4728,19 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                         ),
                     }
                 )
+                if collect_candidate_trace:
+                    record.update(
+                        {
+                            "accepted_path_node_indices": [
+                                int(node_index)
+                                for node_index in accepted_path
+                            ],
+                            "accepted_token_ids": [
+                                int(token) for token in accepted_tokens
+                            ],
+                            "correction_token_id": int(correction),
+                        }
+                    )
                 trace.append(record)
 
         if persistent_bank_transitions is not None:
@@ -4096,6 +4762,128 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 persistent_bank_counts[token] = bank_count
 
         generated_ids = input_ids[0, prompt_length:]
+        if collect_selective_reuse:
+            generated_token_values = [
+                int(token) for token in generated_ids.tolist()
+            ]
+            for record in trace:
+                generated_offset = record.pop(
+                    "selective_generated_offset", None
+                )
+                u_paths = record.pop(
+                    "_selective_u_path_token_ids", []
+                )
+                gc_paths = record.pop(
+                    "_selective_gc_path_token_ids", []
+                )
+                if generated_offset is None:
+                    continue
+                future = generated_token_values[int(generated_offset) :]
+                target_token = future[0] if future else None
+                max_candidate_accept = max(
+                    int(record.get("remaining_tokens", len(future))) - 1,
+                    0,
+                )
+                u_accept = min(
+                    self._longest_matching_path(u_paths, future),
+                    max_candidate_accept,
+                )
+                gc_accept = min(
+                    self._longest_matching_path(gc_paths, future),
+                    max_candidate_accept,
+                )
+                matched_budget = min(len(u_paths), len(gc_paths))
+                u_matched_accept = min(
+                    self._longest_matching_path(
+                        u_paths[:matched_budget], future
+                    ),
+                    max_candidate_accept,
+                )
+                gc_matched_accept = min(
+                    self._longest_matching_path(
+                        gc_paths[:matched_budget], future
+                    ),
+                    max_candidate_accept,
+                )
+                fixed_accept = int(record.get("accept_len", 0))
+                record.update(
+                    {
+                        "selective_output_position": int(generated_offset),
+                        "selective_target_token_id": target_token,
+                        "selective_u_top8_hit": (
+                            target_token
+                            in record.get(
+                                "selective_u_root_candidate_token_ids", []
+                            )
+                            if target_token is not None
+                            else None
+                        ),
+                        "selective_gc_top8_hit": (
+                            target_token
+                            in record.get(
+                                "selective_gc_root_candidate_token_ids", []
+                            )
+                            if target_token is not None
+                            else None
+                        ),
+                        "selective_v_top8_hit": (
+                            target_token
+                            in record.get(
+                                "selective_v_root_candidate_token_ids", []
+                            )
+                            if target_token is not None
+                            else None
+                        ),
+                        "selective_uv_top8_hit": (
+                            target_token
+                            in record.get(
+                                "selective_uv_root_candidate_token_ids", []
+                            )
+                            if target_token is not None
+                            else None
+                        ),
+                        "selective_uv_minus_u_top8_hit": (
+                            int(
+                                target_token
+                                in record.get(
+                                    "selective_uv_root_candidate_token_ids", []
+                                )
+                            )
+                            - int(
+                                target_token
+                                in record.get(
+                                    "selective_u_root_candidate_token_ids", []
+                                )
+                            )
+                            if target_token is not None
+                            else None
+                        ),
+                        "selective_u_shadow_accept_len": int(u_accept),
+                        "selective_gc_shadow_accept_len": int(gc_accept),
+                        "selective_gc_minus_u_accept_len": int(
+                            gc_accept - u_accept
+                        ),
+                        "selective_matched_tree_node_budget": int(
+                            matched_budget
+                        ),
+                        "selective_u_matched_accept_len": int(
+                            u_matched_accept
+                        ),
+                        "selective_gc_matched_accept_len": int(
+                            gc_matched_accept
+                        ),
+                        "selective_gc_minus_u_matched_accept_len": int(
+                            gc_matched_accept - u_matched_accept
+                        ),
+                        "selective_exclusive_source_oracle_accept_len": int(
+                            max(u_accept, gc_accept)
+                        ),
+                        "selective_fixed_accept_len": fixed_accept,
+                        "selective_shadow_accept_cap": int(
+                            max_candidate_accept
+                        ),
+                    }
+                )
         keep_tokens = min(int(generated_ids.numel()), int(max_new_tokens))
         for token_index, token_id in enumerate(generated_ids[:keep_tokens].tolist()):
             if int(token_id) in stop_token_ids:

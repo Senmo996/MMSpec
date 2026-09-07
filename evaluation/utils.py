@@ -54,7 +54,9 @@ def load_mmspec_data(data_folder):
                 continue
             d = json.loads(line)
             # Load image
-            img_path = os.path.join(images_dir, d["image"])
+            image_name = d["image"]
+            d.setdefault("image_id", image_name)
+            img_path = os.path.join(images_dir, image_name)
             d["image"] = Image.open(img_path)
             data.append(d)
     
@@ -252,6 +254,16 @@ def save_result(answer_file, sample_data, model_id, choices):
             "choices": choices,
             "tstamp": time.time(),
         }
+        # Evaluation-protocol metadata is intentionally copied through rather
+        # than hidden inside a model choice.  Older callers are unaffected.
+        for key in (
+            "source_index",
+            "image_cluster_id",
+            "analysis_split",
+            "analysis_split_seed",
+        ):
+            if key in sample_data:
+                ans_json[key] = sample_data[key]
         fout.write(json.dumps(ans_json) + "\n")
 
 

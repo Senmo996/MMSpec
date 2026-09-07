@@ -20,17 +20,63 @@ from .controller import (
 )
 
 
+SUPPORTED_MULTIMODAL_ARCHITECTURES = frozenset(
+    {
+        "Qwen2_5_VLForConditionalGeneration",
+        "LlavaForConditionalGeneration",
+        "LlavaNextForConditionalGeneration",
+    }
+)
+
+
+def resolve_image_token_id(config) -> Optional[int]:
+    """Return the image placeholder id used by supported VLM wrappers."""
+
+    arch = config.architectures[0]
+    if arch in ("LlavaForConditionalGeneration", "LlavaNextForConditionalGeneration"):
+        return getattr(
+            config,
+            "image_token_index",
+            getattr(config, "image_token_id", None),
+        )
+    return getattr(config, "image_token_id", None)
+
+
+def resolve_generation_max_length(
+    config,
+    prompt_length: int,
+    max_new_tokens: int,
+    max_length: int,
+) -> int:
+    """Resolve the total decode bound without truncating LLaVA generations.
+
+    LLaVA processors expand an image placeholder into thousands of image
+    tokens.  The recycling implementations historically used a legacy
+    ``max_length=2048`` default, so an already-long LLaVA prompt could silently
+    produce no output even when ``max_new_tokens`` was positive.  Hugging Face
+    generation treats ``max_new_tokens`` as the authoritative bound in this
+    case.  Preserve the historical bound for other architectures while giving
+    supported LLaVA models the requested generation budget.
+    """
+
+    prompt_length = int(prompt_length)
+    requested_end = prompt_length + max(int(max_new_tokens), 0)
+    arch = config.architectures[0]
+    if arch in (
+        "LlavaForConditionalGeneration",
+        "LlavaNextForConditionalGeneration",
+    ):
+        return requested_end
+    return min(int(max_length), requested_end)
+
+
 class SpecModel(_BaseSpecModel):
     """SAM with target-only, fixed, and visually adaptive draft policies."""
 
     def _build_visual_token_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
         arch = self.base_model.config.architectures[0]
         if arch in ("LlavaForConditionalGeneration", "LlavaNextForConditionalGeneration"):
-            image_token_id = getattr(
-                self.base_model.config,
-                "image_token_index",
-                getattr(self.base_model.config, "image_token_id", None),
-            )
+            image_token_id = resolve_image_token_id(self.base_model.config)
             if image_token_id is None:
                 return torch.zeros_like(input_ids[0], dtype=torch.bool)
             return input_ids[0].eq(image_token_id)

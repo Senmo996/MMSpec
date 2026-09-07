@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "status": "synthetic_target_pattern",
+  "warning": "Illustrative values only. These numbers are not derived from any experiment and must not be reported as results.",
+  "intended_future_scope": {
+    "split": "independent held-out set",
+    "benchmarks": 8,
+    "excluded_benchmarks": [
+      "MME"
+    ],
+    "tail_definition": "within-benchmark bottom/top two visual-dependence deciles",
+    "uncertainty": "image-cluster bootstrap 95% confidence intervals"
+  },
+  "point_estimates": {
+    "low": {
+      "u_coverage": 0.93,
+      "gc_coverage": 0.48,
+      "u_conditional_top8_recall": 0.85,
+      "gc_conditional_top8_recall": 0.72,
+      "gc_minus_u_matched_accept": -0.42
+    },
+    "high": {
+      "u_coverage": 0.91,
+      "gc_coverage": 0.34,
+      "u_conditional_top8_recall": 0.56,
+      "gc_conditional_top8_recall": 0.84,
+      "gc_minus_u_matched_accept": 0.48
+    }
+  },
+  "confidence_intervals_95": {
+    "low": {
+      "u_coverage": [0.91, 0.95],
+      "gc_coverage": [0.44, 0.52],
+      "u_conditional_top8_recall": [0.82, 0.88],
+      "gc_conditional_top8_recall": [0.68, 0.76],
+      "gc_minus_u_matched_accept": [-0.54, -0.30]
+    },
+    "high": {
+      "u_coverage": [0.89, 0.93],
+      "gc_coverage": [0.30, 0.38],
+      "u_conditional_top8_recall": [0.51, 0.61],
+      "gc_conditional_top8_recall": [0.80, 0.88],
+      "gc_minus_u_matched_accept": [0.35, 0.61]
+    }
+  }
+}

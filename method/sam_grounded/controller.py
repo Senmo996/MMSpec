@@ -81,6 +81,21 @@ PERSISTENT_OPTIMIZED_DEPTH_POLICIES = frozenset(
     }
 )
 
+MATCHED_BUDGET_CONTROL_POLICIES = frozenset(
+    {
+        "fixed-depth10-node63-wide8",
+        "score-prior-depth10-node63-wide8",
+        "context-score-trigram-strict-depth10-node63-wide8",
+        "context-score-trigram-fusion-uniform-depth10-node63-wide8",
+        "context-score-trigram-fusion-depth10-node63-wide8",
+        "context-score-trigram-fusion-persistent-depth10-node63-wide8",
+    }
+) | frozenset(
+    f"{allocator}-depth10-node{budget}-wide8"
+    for allocator in ("fixed", "score-prior")
+    for budget in (31, 47, 63, 79, 95)
+)
+
 
 @dataclass(frozen=True)
 class DraftDecision:
@@ -285,6 +300,7 @@ class GroundedDraftController:
         | PERSISTENT_DEPTH_NODE_BUDGET_POLICIES
         | PERSISTENT_ADAPTIVE_DEPTH_POLICIES
         | PERSISTENT_OPTIMIZED_DEPTH_POLICIES
+        | MATCHED_BUDGET_CONTROL_POLICIES
     )
 
     def __init__(
@@ -399,6 +415,7 @@ class GroundedDraftController:
             | PERSISTENT_DEPTH_NODE_BUDGET_POLICIES
             | PERSISTENT_ADAPTIVE_DEPTH_POLICIES
             | PERSISTENT_OPTIMIZED_DEPTH_POLICIES
+            | MATCHED_BUDGET_CONTROL_POLICIES
         ):
             budget, risk = self.max_draft_tokens, 0.0
         elif self.policy == "short":

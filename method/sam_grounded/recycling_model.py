@@ -15,7 +15,12 @@ from .controller import (
     VisualGroundingCalibrator,
     confidence_from_logits,
 )
-from .spec_model import SpecModel as _GroundedSamSpecModel
+from .spec_model import (
+    SUPPORTED_MULTIMODAL_ARCHITECTURES,
+    SpecModel as _GroundedSamSpecModel,
+    resolve_generation_max_length,
+    resolve_image_token_id,
+)
 
 
 class RecyclingSpecModel(_GroundedSamSpecModel):
@@ -72,6 +77,7 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
         grounding_layer=-1,
         confidence_margin_scale=5.0,
         matrix_top_k=4,
+        candidate_trace_diagnostics=False,
         return_policy_trace=False,
         disable_repeat_guard=True,
         **kwargs,
@@ -97,7 +103,17 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
         )
         stop_token_ids = _collect_stop_token_ids(self.tokenizer, self.base_model)
         prompt_length = int(input_ids.shape[1])
-        max_length = min(int(max_length), prompt_length + int(max_new_tokens))
+        arch = self.base_model.config.architectures[0]
+        if arch not in SUPPORTED_MULTIMODAL_ARCHITECTURES:
+            raise NotImplementedError(
+                f"Grounded Recycling does not support architecture {arch}"
+            )
+        max_length = resolve_generation_max_length(
+            self.base_model.config,
+            prompt_length,
+            max_new_tokens,
+            max_length,
+        )
         matrix_top_k = max(int(matrix_top_k), 1)
 
         if hasattr(self, "recycling_past_key_values"):
@@ -121,17 +137,11 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
             self.recycling_past_key_values_data = past_key_values_data
             self.recycling_current_length_data = current_length_data
 
-        arch = self.base_model.config.architectures[0]
-        if arch != "Qwen2_5_VLForConditionalGeneration":
-            raise NotImplementedError(
-                "The grounded Recycling pilot currently targets Qwen2.5-VL"
-            )
-
-        image_token_id = self.base_model.config.image_token_id
+        image_token_id = resolve_image_token_id(self.base_model.config)
         visual_mask = self._build_visual_token_mask(input_ids).detach()
         pixel_values = kwargs.get("pixel_values")
         image_grid_thw = kwargs.get("image_grid_thw")
-        if inputs_embeds is None:
+        if arch == "Qwen2_5_VLForConditionalGeneration" and inputs_embeds is None:
             inputs_embeds = self.base_model.model.embed_tokens(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.base_model.visual.dtype)
@@ -189,6 +199,9 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
         kwargs = {}
         acceptance_lengths = []
         trace = []
+        collect_candidate_trace = bool(
+            return_policy_trace and candidate_trace_diagnostics
+        )
 
         idx = -1
         for idx in range(max_length - prompt_length):
@@ -200,6 +213,11 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
 
             decision = controller.decide(grounding_score, confidence)
             last_token = int(input_ids[0, -1].item())
+            root_transition_topk = (
+                [int(token) for token in transitions[last_token].tolist()]
+                if bool(transition_valid[last_token].item())
+                else []
+            )
             raw_draft = []
             current_token = last_token
             seen_transitions = set()
@@ -208,7 +226,10 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
                     break
                 next_token = int(transitions[current_token, 0].item())
                 edge = (current_token, next_token)
-                if next_token == image_token_id or edge in seen_transitions:
+                if (
+                    image_token_id is not None
+                    and next_token == image_token_id
+                ) or edge in seen_transitions:
                     break
                 seen_transitions.add(edge)
                 raw_draft.append(next_token)
@@ -224,6 +245,27 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
                 "used_draft_len": used_len,
                 "remaining_tokens": remaining,
             }
+            if collect_candidate_trace:
+                record.update(
+                    {
+                        "root_token_id": last_token,
+                        "generated_prefix_tail_token_ids": [
+                            int(token)
+                            for token in input_ids[
+                                0, max(prompt_length, input_ids.shape[1] - 16) :
+                            ].tolist()
+                        ],
+                        "root_transition_topk_token_ids": (
+                            root_transition_topk
+                        ),
+                        "candidate_path_token_ids": [
+                            int(token) for token in raw_draft
+                        ],
+                        "used_candidate_path_token_ids": [
+                            int(token) for token in draft_tokens
+                        ],
+                    }
+                )
             if not trace and calibrator is not None:
                 record["grounding_calibration"] = calibrator.diagnostics()
 
@@ -237,6 +279,9 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
                     output_hidden_states=True,
                 )
                 next_id = torch.argmax(output.logits[:, -1, :], dim=-1)
+                verifier_prediction_token_ids = [int(next_id.item())]
+                accepted_token_ids = []
+                correction_token_id = int(next_id.item())
                 transitions[last_token] = output.logits[0, -1].topk(
                     matrix_top_k
                 ).indices
@@ -268,10 +313,19 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
                 transition_valid[chunk[0]] = True
 
                 predictions = torch.argmax(output.logits, dim=-1)
+                verifier_prediction_token_ids = [
+                    int(token) for token in predictions[0].tolist()
+                ]
                 same = predictions[:, :used_len].eq(draft)
                 mismatch = (~same).squeeze(0).nonzero(as_tuple=True)[0]
                 accept_len = (
                     int(mismatch[0].item()) if mismatch.numel() > 0 else used_len
+                )
+                accepted_token_ids = [
+                    int(token) for token in draft_tokens[:accept_len]
+                ]
+                correction_token_id = int(
+                    predictions[0, accept_len].item()
                 )
                 tokens_to_add = torch.cat(
                     [draft[:, :accept_len], predictions[:, accept_len : accept_len + 1]],
@@ -300,6 +354,16 @@ class RecyclingSpecModel(_GroundedSamSpecModel):
                     "acceptance_ema_after": float(controller.acceptance_ema),
                 }
             )
+            if collect_candidate_trace:
+                record.update(
+                    {
+                        "verifier_prediction_token_ids": (
+                            verifier_prediction_token_ids
+                        ),
+                        "accepted_token_ids": accepted_token_ids,
+                        "correction_token_id": correction_token_id,
+                    }
+                )
             trace.append(record)
             acceptance_lengths.append(int(accept_len))
 

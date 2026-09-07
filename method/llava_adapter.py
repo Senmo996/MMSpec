@@ -54,13 +54,74 @@ def _forward_with_custom_cache(super_forward, *args, **kwargs):
     return outputs
 
 
+def _build_tree_attention_mask(tree_mask, past_length, input_tensor):
+    """Build the additive 4-D mask expected by current HF LLaMA attention."""
+
+    query_length = int(input_tensor.shape[1])
+    if tree_mask.dim() != 4 or tuple(tree_mask.shape[-2:]) != (
+        query_length,
+        query_length,
+    ):
+        raise ValueError(
+            "tree_mask must have shape [batch, heads, query_length, query_length]"
+        )
+    batch_size = int(input_tensor.shape[0])
+    key_length = int(past_length) + query_length
+    additive_mask = torch.zeros(
+        (batch_size, 1, query_length, key_length),
+        dtype=input_tensor.dtype,
+        device=input_tensor.device,
+    )
+    allowed = tree_mask.to(device=input_tensor.device, dtype=torch.bool)
+    fill_value = torch.finfo(input_tensor.dtype).min
+    additive_mask[..., int(past_length) :] = torch.where(
+        allowed,
+        torch.zeros((), dtype=input_tensor.dtype, device=input_tensor.device),
+        torch.full((), fill_value, dtype=input_tensor.dtype, device=input_tensor.device),
+    )
+    return additive_mask
+
+
 def _patch_tree_mask_for_llama_model(model):
     """Inject tree_mask support into HF LLaMA causal mask update for speculative tree decoding."""
     language_model = getattr(model, "language_model", None)
-    llama_model = getattr(language_model, "model", None)
-    if llama_model is None or not hasattr(llama_model, "_update_causal_mask"):
+    llama_model = getattr(language_model, "model", language_model)
+    if llama_model is None:
         return
     if getattr(llama_model, "_mmspec_tree_mask_patched", False):
+        return
+
+    if not hasattr(llama_model, "_update_causal_mask"):
+        original_forward = llama_model.forward
+
+        def _forward_with_tree_mask(self, *args, **kwargs):
+            tree_mask = getattr(self, "tree_mask", None)
+            attention_mask = kwargs.get("attention_mask")
+            if tree_mask is not None and not (
+                isinstance(attention_mask, torch.Tensor)
+                and attention_mask.dim() == 4
+            ):
+                input_tensor = kwargs.get("inputs_embeds")
+                input_ids = kwargs.get("input_ids")
+                if input_tensor is None and input_ids is None and args:
+                    input_ids = args[0]
+                if input_tensor is None:
+                    input_tensor = self.embed_tokens(input_ids)
+                past_key_values = kwargs.get("past_key_values")
+                past_length = (
+                    int(past_key_values.get_seq_length())
+                    if past_key_values is not None
+                    else 0
+                )
+                kwargs["attention_mask"] = _build_tree_attention_mask(
+                    tree_mask,
+                    past_length,
+                    input_tensor,
+                )
+            return original_forward(*args, **kwargs)
+
+        llama_model.forward = types.MethodType(_forward_with_tree_mask, llama_model)
+        llama_model._mmspec_tree_mask_patched = True
         return
 
     original_update = llama_model._update_causal_mask
@@ -129,6 +190,13 @@ def _patch_tree_mask_for_llama_model(model):
     llama_model._mmspec_tree_mask_patched = True
 
 
+def _forward_llava_with_custom_cache(super_forward, *args, **kwargs):
+    output_last_hidden_state = bool(kwargs.pop("output_last_hidden_state", False))
+    if output_last_hidden_state:
+        kwargs["output_hidden_states"] = True
+    return _forward_with_custom_cache(super_forward, *args, **kwargs)
+
+
 class CustomLlavaForConditionalGeneration(LlavaForConditionalGeneration):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
@@ -137,7 +205,7 @@ class CustomLlavaForConditionalGeneration(LlavaForConditionalGeneration):
         return model
 
     def forward(self, *args, **kwargs):
-        return _forward_with_custom_cache(super().forward, *args, **kwargs)
+        return _forward_llava_with_custom_cache(super().forward, *args, **kwargs)
 
 
 class CustomLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration):
@@ -148,4 +216,4 @@ class CustomLlavaNextForConditionalGeneration(LlavaNextForConditionalGeneration)
         return model
 
     def forward(self, *args, **kwargs):
-        return _forward_with_custom_cache(super().forward, *args, **kwargs)
+        return _forward_llava_with_custom_cache(super().forward, *args, **kwargs)

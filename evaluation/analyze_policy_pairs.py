@@ -6,7 +6,10 @@ import random
 import statistics
 from pathlib import Path
 
-from summarize_training_free import load_turns
+try:
+    from .summarize_training_free import load_turns
+except ImportError:  # Direct script execution from MMSpec/evaluation.
+    from summarize_training_free import load_turns
 
 
 def _sample_rows(jsonl_path):
@@ -79,6 +82,8 @@ def compare(
             continue
         current_speed = current["tokens"] / current["wall_time"]
         reference_speed = reference["tokens"] / reference["wall_time"]
+        if reference_speed <= 0:
+            continue
         row = {
             "key": key,
             "topic": current["topic"],

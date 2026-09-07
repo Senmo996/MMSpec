@@ -10,7 +10,11 @@ from method.sam_grounded.controller import (
     confidence_from_logits,
 )
 from method.sam_grounded.tree_recycling_model import TreeRecyclingSpecModel
-from evaluation.eval_sam_grounded_mmspec import _parse_policies, _select_topic_indices
+from evaluation.eval_sam_grounded_mmspec import (
+    _parse_policies,
+    _sample_order_indices,
+    _select_topic_indices,
+)
 
 
 def test_visual_grounding_calibration_separates_visual_and_text_states():
@@ -970,6 +974,7 @@ def test_fourgram_score_tree_precedes_trigram_and_records_three_token_context():
     [
         ("strict", [0, 1, 2, 3, 4]),
         ("residual2", [0, 1, 2, 5, 6]),
+        ("fusion_uniform", [0, 1, 5, 7, 2]),
         ("fusion", [0, 1, 2, 3, 5]),
         ("fusion55", [0, 1, 2, 5, 3]),
         ("fusion_adaptive", [0, 1, 2, 5, 3]),
@@ -1346,3 +1351,40 @@ def test_balanced_topic_selection_supports_disjoint_holdout_offsets():
 
     assert _select_topic_indices(data, samples_per_topic=1, topic_offset=0) == [0, 1]
     assert _select_topic_indices(data, samples_per_topic=2, topic_offset=1) == [2, 3, 4, 5]
+
+
+def test_sample_order_seed_is_reproducible_and_optional():
+    assert _sample_order_indices(5, None) == [0, 1, 2, 3, 4]
+    assert _sample_order_indices(8, 17) == _sample_order_indices(8, 17)
+    assert _sample_order_indices(8, 17) != _sample_order_indices(8, 18)
+    assert sorted(_sample_order_indices(8, 17)) == list(range(8))
+
+
+def test_matched_budget_controls_share_tree_shape_and_node_cap():
+    policies = (
+        "fixed-depth10-node63-wide8",
+        "score-prior-depth10-node63-wide8",
+        "context-score-trigram-strict-depth10-node63-wide8",
+        "context-score-trigram-fusion-uniform-depth10-node63-wide8",
+        "context-score-trigram-fusion-depth10-node63-wide8",
+        "context-score-trigram-fusion-persistent-depth10-node63-wide8",
+    )
+    common = (0.0, 1.0, 0.0, 0.55, 0.75, 2, 4, 4, 3)
+    for policy in policies:
+        assert _parse_policies(policy) == [policy]
+        assert TreeRecyclingSpecModel._tree_shape(policy, *common) == (8, 10)
+        assert TreeRecyclingSpecModel._effective_tree_node_budget(
+            policy, 95, None
+        ) == 63
+
+
+def test_matched_allocator_budget_sweep_uses_declared_cap():
+    common = (0.0, 1.0, 0.0, 0.55, 0.75, 2, 4, 4, 3)
+    for allocator in ("fixed", "score-prior"):
+        for budget in (31, 47, 63, 79, 95):
+            policy = f"{allocator}-depth10-node{budget}-wide8"
+            assert _parse_policies(policy) == [policy]
+            assert TreeRecyclingSpecModel._tree_shape(policy, *common) == (8, 10)
+            assert TreeRecyclingSpecModel._effective_tree_node_budget(
+                policy, 95, None
+            ) == budget
