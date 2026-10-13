@@ -1,4 +1,4 @@
-"""Evaluate Lookahead decoding on the fixed NewDream/DREAM benchmark manifests."""
+"""Evaluate Lookahead decoding on the fixed Fovea/DREAM benchmark manifests."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from method.lookahead.spec_model_lookahead import (  # noqa: E402
 )
 from method.vispec.kv_cache import initialize_past_key_values  # noqa: E402
 from method.vispec.utils import prepare_logits_processor  # noqa: E402
-from new_dream.evaluation import eval_llava_fixed_multi as fixed_eval  # noqa: E402
+from method.fovea.evaluation import eval_llava_fixed_multi as fixed_eval  # noqa: E402
 
 
 REPO_MMSPEC_TEST = PROJECT_ROOT / "MMSpec" / "dataset" / "MMSpec" / "test"
@@ -288,7 +288,7 @@ def evaluate_dataset(model, dataset, selected, manifest, manifest_path, args, ru
                 "top_p": args.top_p,
                 "torch_dtype": "auto",
                 "compact_eval": args.quiet and args.skip_final_decode and args.no_save_decoded_output,
-                "primary_speedup_policy": "newdream_global_sum_time_ratio",
+                "primary_speedup_policy": "fovea_global_sum_time_ratio",
             },
         }
     )
@@ -354,7 +354,7 @@ def main() -> None:
     print(f"temperature={args.temperature}")
     print(f"top_p={args.top_p}")
     print(f"attn_implementation={args.attn_implementation}")
-    print("primary_speedup_policy=newdream_global_sum_time_ratio")
+    print("primary_speedup_policy=fovea_global_sum_time_ratio")
     print(f"mmspec_root={fixed_eval.MMSPEC_ROOT}")
 
     selected_by_dataset = {}
@@ -407,7 +407,7 @@ def main() -> None:
             "sample_num": args.sample_num,
             "seed": args.seed,
             "device": args.device,
-            "primary_speedup_policy": "newdream_global_sum_time_ratio",
+            "primary_speedup_policy": "fovea_global_sum_time_ratio",
             "qwen_processor_min_pixels": fixed_eval.QWEN_MIN_PIXELS,
             "qwen_processor_max_pixels": fixed_eval.QWEN_MAX_PIXELS,
             "qwen_image_factor": fixed_eval.QWEN_IMAGE_FACTOR,

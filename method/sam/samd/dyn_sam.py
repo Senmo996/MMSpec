@@ -14,7 +14,7 @@ class DynSAM:
         length: int
         min_endpos: int
 
-    def __init__(self, n_predicts: int = 40, alpha: float = 4.0, device: str = "cuda"):
+    def __init__(self, n_predicts: int = 40, alpha: float = 4.0, device: str = "cuda", clone_mode: str = "deepcopy"):
         self.alpha = alpha
         self.n_predicts = n_predicts
         self.states: List[DynSAM.SAMState] = [DynSAM.SAMState(next={}, link=-1, length=0, min_endpos=0)]
@@ -22,10 +22,17 @@ class DynSAM:
         self.last = 0
         self.max_length = 0
         self.device = device
+        self.set_clone_mode(clone_mode)
         
         # params needed to be reset for each query
         self.cur_index = 0
         self.cur_length = 0
+
+    def set_clone_mode(self, mode: str):
+        """Select an equivalent state copier without changing SAM contents."""
+        if mode not in ("deepcopy", "flat"):
+            raise ValueError("SAM clone mode must be deepcopy or flat")
+        self.clone_mode = mode
     
     def reset(self):
         self.states: List[DynSAM.SAMState] = [DynSAM.SAMState(next={}, link=-1, length=0, min_endpos=0)]
@@ -60,7 +67,17 @@ class DynSAM:
             if self.states[p].length + 1 == self.states[q].length:
                 self.states[cur].link = q
             else:
-                clone = self.expand_state(deepcopy(self.states[q]))
+                source = self.states[q]
+                if self.clone_mode == "flat":
+                    # All payloads are integers. Only the transition dictionary
+                    # needs independent storage; recursive copying is redundant.
+                    cloned_state = DynSAM.SAMState(
+                        next=source.next.copy(), link=source.link,
+                        length=source.length, min_endpos=source.min_endpos,
+                    )
+                else:
+                    cloned_state = deepcopy(source)
+                clone = self.expand_state(cloned_state)
                 self.states[clone].length = self.states[p].length + 1
                 while p != -1 and self.states[p].next[token] == q:
                     self.states[p].next[token] = clone

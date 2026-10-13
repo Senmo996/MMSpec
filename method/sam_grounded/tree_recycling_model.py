@@ -35,6 +35,7 @@ from .spec_model import (
     resolve_image_token_id,
 )
 from .visual_lexical_inventory import fuse_equal_budget_candidates, rank_scores
+from .root_semantic_backoff import RootBackoffMemory, predecessor_keys
 
 
 SELECTIVE_REUSE_PROBE_MODES = frozenset(
@@ -124,6 +125,9 @@ MATCHED_BUDGET_CONTROL_CONFIGS = {
         63,
     ),
     "context-score-trigram-fusion-depth10-node63-wide8": (8, 10, 63),
+    "context-score-trigram-fusion-mass-depth10-node63-wide8": (8, 10, 63),
+    "context-score-trigram-fusion-uniform-mass-depth10-node63-wide8": (8, 10, 63),
+    "context-score-trigram-fusion-agreement-depth10-node63-wide8": (8, 10, 63),
     "context-score-trigram-fusion-persistent-depth10-node63-wide8": (
         8,
         10,
@@ -1032,10 +1036,48 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         copy_candidate_rows: bool = True,
         fast_score_priority_layout: bool = False,
         reserved_path_tokens=None,
+        suffix_inclusive_budget: bool = False,
+        suffix_bridge: bool = False,
+        build_profiler=None,
+        root_backoff_distribution=None,
+        row_fusion=None,
     ):
         # Node indices in the returned flat sequence start at one; zero is the
         # already-generated root token that has not yet entered the KV cache.
         nodes = []
+
+        # The C++ builder implements the fixed prior and its confidence product.
+        fast_confidence_weighting = False
+        if row_fusion is not None and fast_score_priority_layout:
+            rule = getattr(row_fusion, "rule", None)
+            if rule not in ("fixed", "prior_confidence"):
+                raise ValueError("custom row fusion requires the shared Python tree path")
+            fast_confidence_weighting = rule == "prior_confidence"
+
+        if root_backoff_distribution is not None and not score_priority_layout:
+            raise ValueError("root-only backoff requires a score-priority tree")
+
+        if suffix_bridge and not suffix_inclusive_budget:
+            raise ValueError("suffix bridging requires the single-pass inclusive budget")
+        if suffix_inclusive_budget:
+            if not score_priority_layout or fast_score_priority_layout:
+                raise ValueError("single-pass suffix allocation requires the Python score-priority layout")
+            node_budget = max(int(node_budget), 0)
+            # Reserve only valid, distinct prefix nodes. Transition selection
+            # releases a reservation as soon as it selects that same prefix.
+            # The transition frontier and its score order remain unchanged.
+            suffix = []
+            suffix_edges = set()
+            parent_token = int(root_token)
+            for raw_token in (reserved_path_tokens or [])[:min(int(depth), node_budget)]:
+                token = int(raw_token)
+                edge = (parent_token, token)
+                if token == blocked_token_id or edge in suffix_edges:
+                    break
+                suffix.append(token)
+                suffix_edges.add(edge)
+                parent_token = token
+            reserved_path_tokens = suffix
 
         def candidate_distribution_for(
             parent_token,
@@ -1174,6 +1216,21 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             host_global_candidate_scores or (),
                         )
                     return [], []
+                if row_fusion is not None:
+                    return row_fusion(rows, int(level_width))
+                if context_candidate_mode == "fusion_agreement":
+                    # ponytail: agreement is a conservative gate, not calibrated
+                    # reliability; use past verification feedback if it underfits.
+                    def first_eligible(row):
+                        return next(
+                            (token for token in row[0] if token != blocked_token_id),
+                            None,
+                        )
+
+                    primary_token = first_eligible(rows[0])
+                    if primary_token is None:
+                        return [], []
+                    rows = [row for row in rows if first_eligible(row) == primary_token]
                 if context_candidate_mode == "strict" or len(rows) == 1:
                     return rows[0]
                 if context_candidate_mode == "residual2":
@@ -1210,7 +1267,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     total = sum(selected_scores) or 1.0
                     return selected, [score / total for score in selected_scores]
                 if context_candidate_mode.startswith("fusion"):
-                    if context_candidate_mode == "fusion_uniform":
+                    if context_candidate_mode in (
+                        "fusion_uniform", "fusion_uniform_mass", "fusion_agreement"
+                    ):
                         source_weights = (1.0, 1.0, 1.0, 1.0)
                     elif context_candidate_mode == "fusion55":
                         source_weights = (0.55, 0.30, 0.15, 0.05)
@@ -1247,7 +1306,15 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             first_seen[candidate],
                         ),
                     )[:level_width]
-                    total = sum(fused_scores[candidate] for candidate in selected) or 1.0
+                    if context_candidate_mode in (
+                        "fusion_mass", "fusion_uniform_mass", "fusion_agreement"
+                    ):
+                        # Normalize source weights, not the retained Top-K mass.
+                        # Discarded candidates must not inflate surviving scores.
+                        total = sum(source_weights[min(i, len(source_weights) - 1)]
+                                    for i in range(len(rows)))
+                    else:
+                        total = sum(fused_scores[candidate] for candidate in selected) or 1.0
                     return selected, [
                         fused_scores[candidate] / total for candidate in selected
                     ]
@@ -1334,6 +1401,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 trigram_rows=host_trigram_transitions or {},
                 trigram_scores=host_trigram_transition_scores or {},
                 hit_masses=list(resolved_hit_masses),
+                root_backoff_candidates=(root_backoff_distribution[0] if root_backoff_distribution else []),
+                root_backoff_scores=(root_backoff_distribution[1] if root_backoff_distribution else []),
+                confidence_weighting=fast_confidence_weighting,
             )
             nodes = [
                 {
@@ -1370,6 +1440,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             selected_nodes = []
             candidate_cache = {}
             pending = []
+            reserved_remaining = len(reserved_path_tokens or []) if suffix_inclusive_budget else 0
+            reserved_prefix_paths = {()}
+            selection_limit = node_budget - reserved_remaining
 
             def push_children(parent_path, parent_score):
                 current_depth = len(parent_path) + 1
@@ -1404,6 +1477,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                         ),
                     )
                     candidate_cache[cache_key] = candidate_distribution
+                # This override is root-only, even if a descendant repeats its key.
+                if not parent_path and not candidate_distribution[0] and root_backoff_distribution is not None:
+                    candidate_distribution = (root_backoff_distribution[0][:level_width], root_backoff_distribution[1][:level_width])
                 candidates, probabilities = candidate_distribution
                 hit_mass = hit_masses[
                     min(current_depth - 1, len(hit_masses) - 1)
@@ -1438,7 +1514,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     )
 
             push_children((), 1.0)
-            while pending and len(selected_nodes) < node_budget:
+            while pending and len(selected_nodes) < selection_limit:
                 (
                     negative_score,
                     rank_path,
@@ -1446,6 +1522,15 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     parent_path,
                     path_edges,
                 ) = heapq.heappop(pending)
+                if (
+                    reserved_remaining
+                    and parent_path in reserved_prefix_paths
+                    and len(rank_path) <= len(reserved_path_tokens)
+                    and candidate == reserved_path_tokens[len(rank_path) - 1]
+                ):
+                    reserved_remaining -= 1
+                    selection_limit += 1
+                    reserved_prefix_paths.add(rank_path)
                 node = {
                     "token": candidate,
                     "depth": len(rank_path),
@@ -1627,13 +1712,12 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 if not frontier or len(nodes) >= node_budget:
                     break
 
+        main_node_count = len(nodes)
+        suffix_terminal_index = None
         if reserved_path_tokens:
-            # A suffix-automaton match is a single high-value path rather than
-            # another independent transition distribution.  Reuse any prefix
-            # already selected by the score-priority tree and append only the
-            # missing suffix nodes.  At most a handful of rows are added, so
-            # the path improves coverage without displacing globally ranked
-            # recycling candidates.
+            # Reuse selected prefixes and append only missing suffix nodes.
+            # In suffix-inclusive mode their slots were accounted for during
+            # selection, so merging cannot exceed the shared candidate cap.
             children = {
                 (int(node["parent"]), int(node["token"])): flat_index
                 for flat_index, node in enumerate(nodes, start=1)
@@ -1668,7 +1752,78 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 parent_index = child_index
                 parent_token = token
                 parent_depth = node_depth
+            if parent_depth:
+                suffix_terminal_index = parent_index
 
+        pre_bridge_node_count = len(nodes)
+        suffix_added_nodes = pre_bridge_node_count - main_node_count
+        bridge_opportunity = bool(
+            suffix_inclusive_budget and suffix_added_nodes
+            and len(nodes) < node_budget
+            and nodes[suffix_terminal_index - 1]["depth"] < depth
+        )
+        if suffix_bridge and bridge_opportunity:
+            # The original transition tree and inserted suffix remain a stable
+            # packed prefix. Only unused budget may extend the suffix endpoint.
+            # All descendants share that endpoint, so its unknown acceptance
+            # mass is a common factor and is not needed for their local ranking.
+            suffix_tokens = []
+            index = suffix_terminal_index
+            while index:
+                suffix_tokens.append(int(nodes[index - 1]["token"]))
+                index = int(nodes[index - 1]["parent"])
+            suffix_tokens.reverse()
+            context = (
+                int(root_token), root_previous_token,
+                root_previous_previous_token,
+                root_previous_previous_previous_token,
+            )
+            edges = frozenset()
+            for token in suffix_tokens:
+                edges = edges | {(context[0], token)}
+                context = (token, context[0], context[1], context[2])
+            bridge_pending = []
+            resolved_branch_width = width if branch_width is None else branch_width
+            bridge_hit_masses = score_hit_masses or (0.68, 0.63, 0.50, 0.43, 0.40, 0.38)
+
+            def push_bridge_children(parent_index, parent_score, rank_path,
+                                     context, path_edges):
+                next_depth = int(nodes[parent_index - 1]["depth"]) + 1
+                if next_depth > depth:
+                    return
+                candidates, probabilities = candidate_distribution_for(
+                    context[0], resolved_branch_width,
+                    previous_token=context[1],
+                    previous_previous_token=context[2],
+                    previous_previous_previous_token=context[3],
+                )
+                mass = bridge_hit_masses[min(next_depth - 1, len(bridge_hit_masses) - 1)]
+                seen = set()
+                for rank, (token, probability) in enumerate(zip(candidates, probabilities), 1):
+                    token = int(token)
+                    edge = (context[0], token)
+                    if token in seen or token == blocked_token_id or edge in path_edges:
+                        continue
+                    seen.add(token)
+                    score = parent_score * mass * float(probability)
+                    heapq.heappush(bridge_pending, (
+                        -score, (*rank_path, rank), token, parent_index,
+                        next_depth, (token, context[0], context[1], context[2]),
+                        path_edges | {edge},
+                    ))
+
+            push_bridge_children(suffix_terminal_index, 1.0, (), context, edges)
+            while bridge_pending and len(nodes) < node_budget:
+                negative_score, rank_path, token, parent, node_depth, context, edges = heapq.heappop(bridge_pending)
+                nodes.append({
+                    "token": token, "parent": parent, "depth": node_depth,
+                    "rank": rank_path[-1],
+                })
+                if len(nodes) < node_budget:
+                    push_bridge_children(len(nodes), -negative_score, rank_path, context, edges)
+
+        if build_profiler is not None:
+            build_profiler.switch("topology_packing")
         topology_key = (
             transitions.device.type,
             transitions.device.index,
@@ -1715,10 +1870,19 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
 
         flat_tokens = [root_token] + [node["token"] for node in nodes]
         if metadata_out is not None:
+            if metadata_out.get("_suffix_bridge_diagnostics", False):
+                metadata_out.update(
+                    suffix_added_nodes=suffix_added_nodes,
+                    suffix_node_start=main_node_count + 1,
+                    suffix_bridge_opportunity=bridge_opportunity,
+                    suffix_bridge_added_nodes=len(nodes) - pre_bridge_node_count,
+                    suffix_bridge_node_start=pre_bridge_node_count + 1,
+                    pre_bridge_candidate_nodes=pre_bridge_node_count,
+                )
             metadata_out["node_ranks"] = [0] + [
                 int(node["rank"]) for node in nodes
             ]
-            if metadata_out.get("_candidate_trace_diagnostics", False):
+            if metadata_out.get("_candidate_trace_diagnostics", False) or metadata_out.get("_root_backoff", False):
                 metadata_out["node_parents"] = [
                     int(node["parent"]) for node in nodes
                 ]
@@ -1761,6 +1925,51 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 ],
             ]
         return flat_tokens, mask, positions, paths
+
+    @staticmethod
+    def _build_tree_budgeted(root_token, transitions, transition_valid, width,
+                             depth, node_budget, blocked_token_id, **kwargs):
+        """Include the reserved suffix in the total cap; refill overlap slack.
+
+        This experimental control reuses the production score selection. It
+        never truncates DFS-packed nodes, which are not in selection order.
+        """
+        budget = max(int(node_budget), 0)
+        suffix = list(kwargs.get("reserved_path_tokens") or [])[:min(depth, budget)]
+        kwargs["reserved_path_tokens"] = suffix
+        main_budget = budget - len(suffix)
+        # ponytail: a few small rebuilds recover overlap slack; use a native
+        # reserved-slot allocator only if this measured control overhead dominates.
+        while True:
+            result = TreeRecyclingSpecModel._build_tree(
+                root_token, transitions, transition_valid, width, depth,
+                main_budget, blocked_token_id, **kwargs,
+            )
+            used = len(result[0]) - 1
+            if used > budget:
+                raise RuntimeError("suffix-inclusive candidate budget exceeded")
+            if used == budget or main_budget == budget:
+                return result
+            main_budget = min(budget, main_budget + budget - used)
+
+    @staticmethod
+    def _build_tree_budgeted_single_pass(root_token, transitions, transition_valid,
+                                         width, depth, node_budget,
+                                         blocked_token_id, **kwargs):
+        """Select the same suffix/transition union with one topology build.
+
+        Other layout backends retain their existing allocator; this change is
+        confined to the Python score-priority path used by RECAP controls.
+        """
+        if not kwargs.get("score_priority_layout") or kwargs.get("fast_score_priority_layout"):
+            return TreeRecyclingSpecModel._build_tree_budgeted(
+                root_token, transitions, transition_valid, width, depth,
+                node_budget, blocked_token_id, **kwargs,
+            )
+        return TreeRecyclingSpecModel._build_tree(
+            root_token, transitions, transition_valid, width, depth,
+            node_budget, blocked_token_id, suffix_inclusive_budget=True, **kwargs,
+        )
 
     @staticmethod
     def _requires_cache_compaction(accepted_path: List[int]) -> bool:
@@ -1940,6 +2149,21 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         visual_cache_key=None,
         return_policy_trace=False,
         disable_repeat_guard=True,
+        recycling_prompt_init="unigram",
+        recycling_max_order=None,
+        recycling_suffix_length=None,
+        recycling_suffix_implementation="fixed",
+        recycling_suffix_bridge=False,
+        recycling_sam_clone_mode="deepcopy",
+        recycling_suffix_diagnostics=False,
+        recycling_total_node_budget=None,
+        recycling_cache_namespace=None,
+        recycling_stats=None,
+        recycling_profiler=None,
+        recycling_root_backoff="off",
+        recycling_root_backoff_capacity=2048,
+        recycling_root_backoff_neighbors=3,
+        recycling_fusion_rule=None,
         **kwargs,
     ):
         del top_p, top_k, min_draft_tokens, max_draft_tokens, disable_repeat_guard
@@ -1947,8 +2171,35 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if input_ids.shape[0] != 1:
             raise ValueError("Tree Recycling currently supports batch size 1")
+        if recycling_root_backoff not in ("off", "cosine", "recent"):
+            raise ValueError("recycling_root_backoff must be off, cosine, or recent")
+        backoff_enabled = recycling_root_backoff != "off" and draft_policy != "target"
+        if backoff_enabled and (
+            not draft_policy.startswith("context-score-trigram-fusion")
+            or verification_compact_path_repair
+            or verification_margin_threshold > 0
+            or verification_compact_root_margin_threshold > 0
+            or "-committed-" in draft_policy
+            or "-ngram-" in draft_policy
+            or recycling_max_order == 0
+        ):
+            raise ValueError("root backoff supports ordinary U/C/G fusion without repair or bounded persistent n-grams")
         if temperature > 1e-5:
             raise NotImplementedError("Tree Recycling pilot currently supports greedy decoding")
+        if recycling_prompt_init not in ("unigram", "none"):
+            raise ValueError("recycling_prompt_init must be unigram or none")
+        if recycling_max_order not in (None, 0, 1, 2, 3):
+            raise ValueError("recycling_max_order must be 0, 1, 2, 3 or None")
+        if recycling_suffix_length is not None and not 0 <= recycling_suffix_length <= 4:
+            raise ValueError("experimental suffix length must lie in [0, 4]")
+        if recycling_suffix_implementation not in ("fixed", "legacy"):
+            raise ValueError("recycling_suffix_implementation must be fixed or legacy")
+        if recycling_sam_clone_mode not in ("deepcopy", "flat"):
+            raise ValueError("recycling_sam_clone_mode must be deepcopy or flat")
+        if recycling_total_node_budget is not None and recycling_total_node_budget < 0:
+            raise ValueError("total candidate budget must be non-negative")
+        if recycling_cache_namespace is not None and not isinstance(recycling_cache_namespace, str):
+            raise ValueError("cache namespace must be a string")
 
         requested_draft_policy = str(draft_policy)
         collect_candidate_trace = bool(
@@ -2119,7 +2370,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             "visual-hst-backoff-gated",
             "visual-wide-plus2-hst-backoff-gated",
         )
-        need_hidden_states = bool(need_grounding or visual_hst_enabled)
+        need_hidden_states = bool(need_grounding or visual_hst_enabled or (backoff_enabled and recycling_root_backoff == "cosine"))
         # The default grounding signal and HST both consume only the final
         # normalized decoder state.  Retain the full per-layer tuple solely
         # when an explicit non-final grounding layer is requested.
@@ -2504,11 +2755,24 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             use_fourgram_transitions
             or draft_policy.startswith("context-score-trigram-")
         )
+        if recycling_max_order is not None:
+            use_context_transitions = recycling_max_order >= 2
+            use_trigram_transitions = recycling_max_order >= 3
+            use_fourgram_transitions = False
         use_score_priority = draft_policy.startswith(
             ("score-prior-", "score-adaptive-", "context-score-")
         )
         use_hotpath = "-hotpath-" in draft_policy
         use_suffix_reserve = "-suffix4-" in draft_policy
+        if recycling_suffix_length is not None:
+            use_suffix_reserve = recycling_suffix_length > 0
+        if recycling_suffix_bridge and (
+            not use_suffix_reserve or not use_score_priority
+            or recycling_suffix_implementation != "fixed"
+            or recycling_total_node_budget is None
+            or "-hotpath-cpp-" in draft_policy
+        ):
+            raise ValueError("suffix bridging requires fixed suffixes, a total cap, and the Python score-priority layout")
         use_persistent_ngram = bool(
             use_host_transitions and "-persistent-ngram-" in draft_policy
         )
@@ -2555,7 +2819,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 persistent_caches = {}
                 self._gwtr_persistent_unigram_caches = persistent_caches
             persistent_cache = persistent_caches.setdefault(
-                draft_policy,
+                recycling_cache_namespace if recycling_cache_namespace is not None else draft_policy,
                 {"transitions": {}, "scores": {}},
             )
             host_transitions = persistent_cache["transitions"]
@@ -2664,6 +2928,15 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             else None
         )
 
+        backoff_memory = (RootBackoffMemory(
+            recycling_root_backoff, recycling_root_backoff_capacity,
+            recycling_root_backoff_neighbors, matrix_top_k,
+        ) if backoff_enabled else None)
+        backoff_parent_hidden = (
+            self._layer_hidden(init_output, -1)[0, -1].detach().clone()
+            if backoff_enabled and recycling_root_backoff == "cosine" else None
+        )
+
         def store_transitions(
             output,
             token_ids,
@@ -2672,7 +2945,11 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             previous_previous_token_values=None,
             previous_previous_previous_token_values=None,
             output_row_indices=None,
+            backoff_parent_indices=None,
+            backoff_prefill=False,
         ):
+            if recycling_max_order == 0:
+                return
             query_count = int(token_ids.numel())
             if output_row_indices is None:
                 transition_logits = output.logits[0, :query_count]
@@ -2758,6 +3035,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 seen_contexts = set()
                 seen_trigrams = set()
                 seen_fourgrams = set()
+                backoff_aliases = [[] for _ in rows] if backoff_memory is not None else None
                 for row_index, (token, row) in enumerate(zip(tokens, rows)):
                     previous_token = (
                         previous_tokens[row_index]
@@ -2827,6 +3105,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                         normalized_scores = score_rows[row_index]
                     if update_unigram:
                         seen_tokens.add(token)
+                        if backoff_aliases is not None:
+                            backoff_aliases[row_index].append(("U", token))
                         if (
                             persistent_shadow_transitions is not None
                             and token in host_transitions
@@ -2853,6 +3133,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             )
                     if update_context:
                         seen_contexts.add(context_key)
+                        if backoff_aliases is not None:
+                            backoff_aliases[row_index].append(("C", context_key))
                         if use_persistent_ngram:
                             self._store_bounded_transition_row(
                                 host_context_transitions,
@@ -2870,6 +3152,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                                 ] = normalized_scores
                     if update_trigram:
                         seen_trigrams.add(trigram_key)
+                        if backoff_aliases is not None:
+                            backoff_aliases[row_index].append(("G", trigram_key))
                         if use_persistent_ngram:
                             self._store_bounded_transition_row(
                                 host_trigram_transitions,
@@ -2894,6 +3178,18 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             host_fourgram_transition_scores[
                                 fourgram_key
                             ] = normalized_scores
+                if backoff_memory is not None:
+                    if backoff_parent_indices is None:
+                        raise RuntimeError("semantic memory update lacks predecessor topology")
+                    if backoff_prefill:
+                        for i, parent in enumerate(backoff_parent_indices):
+                            if parent < 0:
+                                backoff_aliases[i] = []
+                    keys = (predecessor_keys(
+                        self._layer_hidden(output, -1)[0], backoff_parent_indices,
+                        None if backoff_prefill else backoff_parent_hidden,
+                    ) if recycling_root_backoff == "cosine" else None)
+                    backoff_memory.update(rows, score_rows, backoff_aliases, keys)
                 return
             if use_grounded_conditionals:
                 global_bins = torch.zeros_like(token_ids, dtype=torch.long)
@@ -2931,12 +3227,16 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     accumulate=True,
                 )
 
+        if recycling_profiler is not None:
+            store_transitions = recycling_profiler.wrap_updates(store_transitions)
         prompt_ids = input_ids[0]
         # Building exact bigram rows for every multimodal prompt position is
         # disproportionately expensive on high-resolution images.  Seed the
         # cheap unigram fallback from prefill and learn context rows online
         # from the much smaller verified generation trees instead.
-        if host_transitions is not None:
+        if recycling_prompt_init == "none" or recycling_max_order == 0:
+            prompt_transition_row_count = 0
+        elif host_transitions is not None:
             prompt_values = [int(token) for token in prompt_ids.tolist()]
             (
                 unique_prompt_indices,
@@ -2961,6 +3261,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     prompt_ids.index_select(0, prompt_row_indices),
                     token_values=unique_prompt_values,
                     output_row_indices=prompt_row_indices,
+                    backoff_parent_indices=[i - 1 for i in unique_prompt_indices] if backoff_enabled else None,
+                    backoff_prefill=True,
                 )
         else:
             prompt_transition_row_count = int(prompt_ids.numel())
@@ -2969,6 +3271,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         init_token = torch.argmax(init_output.logits[:, -1, :], dim=-1)
         input_ids = torch.cat([input_ids, init_token[:, None]], dim=1)
         if use_suffix_hybrid or use_suffix_reserve:
+            self.draft.sam_dyn.set_clone_mode(recycling_sam_clone_mode)
             self.draft.reset()
             self.draft.update_tokens(input_ids[0].tolist())
         current_length_data.fill_(input_ids.shape[1] - 1)
@@ -2983,6 +3286,21 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
         if topology_cache is None:
             topology_cache = {}
             self.tree_recycling_topology_cache = topology_cache
+        if recycling_stats is not None:
+            recycling_stats.update(iterations=0, total_candidate_nodes=0,
+                                   max_candidate_nodes=0,
+                                   persistent_rows_at_start=persistent_unigram_size_at_start,
+                                   prompt_rows=prompt_transition_row_count)
+            recycling_stats.update(root_lexical_misses=0, root_backoff_triggers=0,
+                                   root_backoff_accepted_tokens=0, root_backoff_positive_iterations=0)
+            if recycling_suffix_diagnostics:
+                recycling_stats.update(
+                    sam_clone_mode=recycling_sam_clone_mode,
+                    suffix_added_nodes=0, suffix_bridge_opportunities=0,
+                    suffix_bridge_active_iterations=0, suffix_bridge_added_nodes=0,
+                    suffix_bridge_accepted_tokens=0,
+                    total_pre_bridge_candidate_nodes=0,
+                )
 
         for idx in range(max_length - prompt_length):
             generated = int(input_ids.shape[1] - prompt_length)
@@ -2991,6 +3309,9 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             if _has_stop_token(input_ids[0, prompt_length:], stop_token_ids):
                 break
 
+            if recycling_profiler is not None:
+                recycling_profiler.in_decode = True
+                recycling_profiler.switch("decode_other")
             decision = controller.decide(grounding_score, confidence)
             width, depth = self._tree_shape(
                 draft_policy,
@@ -3124,6 +3445,16 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             else:
                 root_transition_top_probability = None
                 root_transition_context_order = 0
+            root_backoff_distribution = None
+            if root_transition_context_order == 0:
+                if recycling_stats is not None:
+                    recycling_stats["root_lexical_misses"] += 1
+                if backoff_memory is not None:
+                    candidates, probabilities = backoff_memory.retrieve(backoff_parent_hidden)
+                    if candidates:
+                        root_backoff_distribution = (candidates, probabilities)
+                        if recycling_stats is not None:
+                            recycling_stats["root_backoff_triggers"] += 1
             root_row_valid_before_backoff = (
                 (
                     root_token in host_transitions
@@ -3292,10 +3623,12 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
             sam_draft_tokens = []
             use_sam_spine = False
             if use_suffix_reserve:
-                sam_draft_tokens, _ = self.draft.lookup_tokens(root_token)
-                sam_draft_tokens = [
-                    int(token) for token in sam_draft_tokens[:4]
-                ]
+                suffix_length = 4 if recycling_suffix_length is None else recycling_suffix_length
+                if recycling_suffix_implementation == "fixed":
+                    sam_draft_tokens = self.draft.lookup_continuation_tokens(suffix_length)
+                else:
+                    sam_draft_tokens, _ = self.draft.lookup_tokens(root_token)
+                    sam_draft_tokens = [int(token) for token in sam_draft_tokens[:suffix_length]]
             elif use_suffix_hybrid:
                 _, sam_draft, _ = self.draft.lookup(root_token)
                 sam_draft_tokens = [
@@ -3345,10 +3678,21 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 if verification_trace_diagnostics
                 or use_context_transitions
                 or collect_candidate_trace
+                or recycling_suffix_diagnostics
                 else None
             )
+            if recycling_suffix_diagnostics:
+                tree_metadata["_suffix_bridge_diagnostics"] = True
+            if backoff_enabled:
+                tree_metadata["_root_backoff"] = True
             if "-trigram-residual2-" in draft_policy:
                 context_candidate_mode = "residual2"
+            elif "-trigram-fusion-agreement-" in draft_policy:
+                context_candidate_mode = "fusion_agreement"
+            elif "-trigram-fusion-uniform-mass-" in draft_policy:
+                context_candidate_mode = "fusion_uniform_mass"
+            elif "-trigram-fusion-mass-" in draft_policy:
+                context_candidate_mode = "fusion_mass"
             elif "-trigram-fusion-uniform-" in draft_policy:
                 context_candidate_mode = "fusion_uniform"
             elif "-trigram-fusion55-" in draft_policy:
@@ -3359,7 +3703,13 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 context_candidate_mode = "fusion"
             else:
                 context_candidate_mode = "strict"
-            flat_tokens, tree_mask, tree_positions, paths = self._build_tree(
+            build_tree = self._build_tree
+            if recycling_total_node_budget is not None:
+                build_tree = self._build_tree_budgeted
+                if use_suffix_reserve and recycling_suffix_implementation == "fixed":
+                    build_tree = self._build_tree_budgeted_single_pass
+                effective_tree_node_budget = min(effective_tree_node_budget, recycling_total_node_budget)
+            flat_tokens, tree_mask, tree_positions, paths = build_tree(
                 root_token,
                 transitions,
                 transition_valid,
@@ -3429,8 +3779,23 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 reserved_path_tokens=(
                     sam_draft_tokens if use_suffix_reserve else None
                 ),
+                suffix_bridge=recycling_suffix_bridge,
+                build_profiler=recycling_profiler,
+                root_backoff_distribution=root_backoff_distribution,
+                row_fusion=recycling_fusion_rule,
             )
             num_nodes = len(flat_tokens) - 1
+            if recycling_stats is not None:
+                recycling_stats["iterations"] += 1
+                recycling_stats["total_candidate_nodes"] += num_nodes
+                recycling_stats["max_candidate_nodes"] = max(recycling_stats["max_candidate_nodes"], num_nodes)
+                if recycling_suffix_diagnostics:
+                    recycling_stats["suffix_added_nodes"] += tree_metadata["suffix_added_nodes"]
+                    recycling_stats["suffix_bridge_opportunities"] += int(tree_metadata["suffix_bridge_opportunity"])
+                    bridge_added = tree_metadata["suffix_bridge_added_nodes"]
+                    recycling_stats["suffix_bridge_active_iterations"] += int(bridge_added > 0)
+                    recycling_stats["suffix_bridge_added_nodes"] += bridge_added
+                    recycling_stats["total_pre_bridge_candidate_nodes"] += tree_metadata["pre_bridge_candidate_nodes"]
             selective_u_paths = []
             selective_gc_paths = []
             selective_u_root_candidates = []
@@ -4090,6 +4455,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     ]
                     if use_fourgram_transitions
                     else None,
+                    backoff_parent_indices=[-1] if backoff_enabled else None,
                 )
                 next_id = torch.argmax(output.logits[:, 0, :], dim=-1)
                 input_ids = torch.cat([input_ids, next_id[:, None]], dim=1)
@@ -4124,6 +4490,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 accept_len = 0
                 query_index = 0
             else:
+                if recycling_profiler is not None:
+                    recycling_profiler.switch("verification_packing")
                 kv_base_len = int(current_length_data[0].item())
                 tree_input = torch.tensor(
                     [flat_tokens], dtype=input_ids.dtype, device=input_ids.device
@@ -4203,6 +4571,8 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     finally:
                         tree_mask_model.tree_mask = None
 
+                if recycling_profiler is not None:
+                    recycling_profiler.switch("accept_commit")
                 queued_predictions = (
                     torch.argmax(
                         output.logits[0, : len(flat_tokens)], dim=-1
@@ -4234,6 +4604,7 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                             if use_fourgram_transitions
                             else None
                         ),
+                        backoff_parent_indices=([-1, *tree_metadata["node_parents"]] if backoff_enabled else None),
                     )
                 if packed_probe_active:
                     actual_tree_length = int(tree_input.shape[1])
@@ -4643,6 +5014,12 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                         else None
                     )
 
+                if recycling_stats is not None and recycling_suffix_diagnostics:
+                    bridge_start = tree_metadata["suffix_bridge_node_start"]
+                    if tree_metadata["suffix_bridge_added_nodes"]:
+                        recycling_stats["suffix_bridge_accepted_tokens"] += sum(
+                            node_index >= bridge_start for node_index in accepted_path[:remaining]
+                        )
                 cache_compaction_applied = bool(
                     not compact_path_repair_applied
                     and self._requires_cache_compaction(accepted_path)
@@ -4677,6 +5054,13 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                     self.draft.update_tokens(
                         (accepted_tokens + [correction])[:remaining]
                     )
+
+            if backoff_memory is not None:
+                if recycling_root_backoff == "cosine":
+                    backoff_parent_hidden = self._layer_hidden(output, -1)[0, query_index].detach().clone()
+                if recycling_stats is not None and root_backoff_distribution is not None:
+                    recycling_stats["root_backoff_accepted_tokens"] += int(accept_len)
+                    recycling_stats["root_backoff_positive_iterations"] += int(accept_len > 0)
 
             if hst_bank is not None:
                 output_hidden = self._layer_hidden(output, -1)[0]
@@ -4761,6 +5145,22 @@ class TreeRecyclingSpecModel(_GroundedSamSpecModel):
                 persistent_bank_scores[token] = bank_scores
                 persistent_bank_counts[token] = bank_count
 
+        if recycling_stats is not None:
+            if backoff_memory is not None:
+                recycling_stats.update(backoff_memory.stats())
+            recycling_stats["memory_rows_at_end"] = {
+                "U": len(host_transitions or {}),
+                "C": len(host_context_transitions or {}),
+                "G": len(host_trigram_transitions or {}),
+            }
+        if recycling_profiler is not None:
+            # Hold references only; traverse sizes outside the timed generation.
+            recycling_profiler.memory_objects = {
+                "U": (host_transitions, host_transition_scores),
+                "C": (host_context_transitions, host_context_transition_scores),
+                "G": (host_trigram_transitions, host_trigram_transition_scores),
+                "topology": topology_cache,
+            }
         generated_ids = input_ids[0, prompt_length:]
         if collect_selective_reuse:
             generated_token_values = [

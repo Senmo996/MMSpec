@@ -88,6 +88,9 @@ MATCHED_BUDGET_CONTROL_POLICIES = frozenset(
         "context-score-trigram-strict-depth10-node63-wide8",
         "context-score-trigram-fusion-uniform-depth10-node63-wide8",
         "context-score-trigram-fusion-depth10-node63-wide8",
+        "context-score-trigram-fusion-mass-depth10-node63-wide8",
+        "context-score-trigram-fusion-uniform-mass-depth10-node63-wide8",
+        "context-score-trigram-fusion-agreement-depth10-node63-wide8",
         "context-score-trigram-fusion-persistent-depth10-node63-wide8",
     }
 ) | frozenset(

@@ -80,6 +80,13 @@ class SpecModel(nn.Module):
         torch_dtype = kwargs.get("torch_dtype", "auto")
         device_map = kwargs.get("device_map", "auto")
         low_cpu_mem_usage = kwargs.get("low_cpu_mem_usage", True)
+        model_load_kwargs = dict(
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            low_cpu_mem_usage=low_cpu_mem_usage,
+        )
+        if kwargs.get("attn_implementation") is not None:
+            model_load_kwargs["attn_implementation"] = kwargs["attn_implementation"]
         
         # Check architecture to load correct class
         config = AutoConfig.from_pretrained(base_model_path)
@@ -89,34 +96,26 @@ class SpecModel(nn.Module):
             from method.vispec.modeling_qwen2_5_vl_kv import Qwen2_5_VLForConditionalGeneration
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 base_model_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-                low_cpu_mem_usage=low_cpu_mem_usage
+                **model_load_kwargs,
             )
         elif arch == "LlavaForConditionalGeneration":
              from method.llava_adapter import CustomLlavaForConditionalGeneration
              model = CustomLlavaForConditionalGeneration.from_pretrained(
                 base_model_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-                low_cpu_mem_usage=low_cpu_mem_usage
+                **model_load_kwargs,
              )
         elif arch == "LlavaNextForConditionalGeneration":
              from method.llava_adapter import CustomLlavaNextForConditionalGeneration
              model = CustomLlavaNextForConditionalGeneration.from_pretrained(
                 base_model_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-                low_cpu_mem_usage=low_cpu_mem_usage
+                **model_load_kwargs,
              )
         else:
              # Fallback or generic
              from transformers import AutoModelForCausalLM
              model = AutoModelForCausalLM.from_pretrained(
                 base_model_path,
-                torch_dtype=torch_dtype,
-                device_map=device_map,
-                low_cpu_mem_usage=low_cpu_mem_usage
+                **model_load_kwargs,
              )
 
         tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False)

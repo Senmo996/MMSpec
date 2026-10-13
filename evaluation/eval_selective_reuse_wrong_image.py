@@ -32,7 +32,7 @@ from evaluation.utils import build_prompt, load_mmspec_data  # noqa: E402
 from method.sam_grounded.tree_recycling_model import (  # noqa: E402
     TreeRecyclingSpecModel,
 )
-from new_dream.evaluation.eval_llava_fixed_multi import (  # noqa: E402
+from method.fovea.evaluation.eval_llava_fixed_multi import (  # noqa: E402
     build_inputs_for_record,
     dataset_slug,
     load_base_dataset,

@@ -30,7 +30,7 @@ from evaluation.selective_reuse_counterfactual_bank_protocol import (
 )
 from evaluation.selective_reuse_protocol import _selected_qwen_logits
 from method.sam_grounded.tree_recycling_model import TreeRecyclingSpecModel
-from new_dream.evaluation.eval_llava_fixed_multi import (
+from method.fovea.evaluation.eval_llava_fixed_multi import (
     build_inputs_for_record,
     dataset_slug,
     load_base_dataset,

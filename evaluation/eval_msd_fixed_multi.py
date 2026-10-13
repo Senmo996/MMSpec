@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from evaluation import eval_eagle2_fixed_multi as eagle_fixed  # noqa: E402
 from method.msd.ea_model import EaModel  # noqa: E402
 from method.msd.utils import temp_cache  # noqa: E402
-from new_dream.evaluation import eval_llava_fixed_multi as fixed_eval  # noqa: E402
+from method.fovea.evaluation import eval_llava_fixed_multi as fixed_eval  # noqa: E402
 
 
 REPO_MMSPEC_TEST = PROJECT_ROOT / "MMSpec" / "dataset" / "MMSpec" / "test"
@@ -288,7 +288,7 @@ def evaluator_config(args) -> MappingLike:
         "torch_dtype": args.torch_dtype,
         "attn_implementation": args.attn_implementation,
         "compact_eval": args.quiet and args.skip_final_decode and args.no_save_decoded_output,
-        "primary_speedup_policy": "newdream_global_sum_time_ratio",
+        "primary_speedup_policy": "fovea_global_sum_time_ratio",
         "baseline_policy": "paired naive decoding with the same MSD custom target model",
     }
 

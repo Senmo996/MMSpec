@@ -73,6 +73,26 @@ class DraftModel(torch.nn.Module):
         #     tree, buffers_kwargs = self.sam_static.gen_dyn_draft(index_static, match_static, start_token)
         #     return (CandidateType.tree, tree, buffers_kwargs)
 
+    def lookup_continuation_tokens(self, max_tokens: int = 4):
+        """Continue the committed suffix without consuming its last token twice.
+
+        RECAP updates the SAM with the whole committed prefix, including the
+        next tree root. Its tracked state already matches that root. Unlike
+        ``lookup_tokens``, this API neither transfers the state on another root
+        nor creates sequence-position tensors: tree verification owns positions.
+        """
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be nonnegative")
+        sam = self.sam_dyn
+        count = min(
+            int(max_tokens), max(sam.n_predicts - 1, 0),
+            max(int(sam.cur_length * sam.alpha), 0),
+        )
+        if count == 0 or sam.cur_index == 0:
+            return []
+        endpos = sam.states[sam.cur_index].min_endpos
+        return sam.input_ids[endpos + 1:endpos + 1 + count]
+
     def update(self,
         tokens: Optional[torch.Tensor] = None,
     ):

@@ -49,12 +49,15 @@ from evaluation.utils import (  # noqa: E402
     reorg_answer_file,
     save_result,
 )
+from method.sam_grounded.official_token_recycling_model import (  # noqa: E402
+    OfficialTokenRecyclingSpecModel,
+)
 from method.sam_grounded.recycling_model import RecyclingSpecModel  # noqa: E402
 from method.sam_grounded.spec_model import SpecModel  # noqa: E402
 from method.sam_grounded.tree_recycling_model import (  # noqa: E402
     TreeRecyclingSpecModel,
 )
-from new_dream.evaluation.eval_llava_fixed_multi import (  # noqa: E402
+from method.fovea.evaluation.eval_llava_fixed_multi import (  # noqa: E402
     build_inputs_for_record,
     dataset_slug,
     load_base_dataset,
@@ -74,6 +77,7 @@ DRAFT_MODEL_CLASSES = {
     "sam": SpecModel,
     "recycling": RecyclingSpecModel,
     "tree-recycling": TreeRecyclingSpecModel,
+    "token-recycling-official": OfficialTokenRecyclingSpecModel,
 }
 
 
@@ -232,6 +236,7 @@ def _write_run_summary(output_root, dataset_results, candidate_policy, args):
             "policies": args.policies,
             "matrix_top_k": args.matrix_top_k,
             "tree_node_budget": args.tree_node_budget,
+            "recycling_fusion_rule": args.recycling_fusion_rule,
             "attn_implementation": args.attn_implementation,
             "limit": args.limit,
             "policy_trace_positions": args.policy_trace_positions,
@@ -245,7 +250,14 @@ def _write_run_summary(output_root, dataset_results, candidate_policy, args):
             "visual_probe_batch_size": args.visual_probe_batch_size,
             "discovery_fraction": args.discovery_fraction,
             "split_seed": args.split_seed,
-            "diagnostic_timing_valid": False,
+            "forward_timing_hooks_enabled": not args.no_policy_trace,
+            "diagnostic_timing_valid": bool(
+                args.no_policy_trace
+                and not args.selective_reuse_diagnostics
+                and not args.candidate_trace_diagnostics
+                and not args.verification_trace_diagnostics
+                and not args.verification_layer_diagnostics
+            ),
         },
     }
     _write_json(Path(output_root) / "summary.json", payload)
@@ -303,7 +315,10 @@ def evaluate(args):
     )
     model.processor = load_processor_for_model(args.base_model_path)
     model.eval()
-    tracker = build_time_breakdown_tracker(model)
+    # Per-forward CUDA synchronization changes throughput, especially when
+    # policies take different numbers of steps. Compact timing uses only the
+    # sample-boundary synchronizations below; tracing retains the old profiler.
+    tracker = None if args.no_policy_trace else build_time_breakdown_tracker(model)
 
     print(f"Loaded model: {args.base_model_path}")
     print(f"Datasets: {','.join(args.datasets)}")
@@ -312,6 +327,8 @@ def evaluate(args):
     print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
     print(f"attention_implementation={args.attn_implementation}")
     print(f"policy_trace_enabled={not args.no_policy_trace}")
+    print(f"recycling_fusion_rule={args.recycling_fusion_rule}")
+    print(f"forward_timing_hooks_enabled={tracker is not None}")
     print(f"policy_trace_positions={args.policy_trace_positions}")
     print(
         "candidate_trace_diagnostics="
@@ -507,7 +524,8 @@ def evaluate(args):
                 )
                 torch.manual_seed(0)
                 torch.cuda.synchronize()
-                tracker.reset()
+                if tracker is not None:
+                    tracker.reset()
                 started = time.perf_counter()
                 result = model.specgenerate(
                     **inputs,
@@ -520,7 +538,8 @@ def evaluate(args):
                 )
                 torch.cuda.synchronize()
                 elapsed = time.perf_counter() - started
-                draft_time, target_time = tracker.snapshot()
+                if tracker is not None:
+                    draft_time, target_time = tracker.snapshot()
                 if collect_policy_trace:
                     output_ids, n_new, idx, accepted, trace = result
                 else:
@@ -586,9 +605,9 @@ def evaluate(args):
                     "new_tokens": [int(n_new)],
                     "wall_time": [float(elapsed)],
                     "acceptance_length": [accepted],
-                    "draft_time": [float(draft_time)],
-                    "target_time": [float(target_time)],
                 }
+                if tracker is not None:
+                    choice.update(draft_time=[float(draft_time)], target_time=[float(target_time)])
                 if collect_policy_trace:
                     choice["policy_trace"] = [trace]
                     if probe_metadata is not None:
@@ -679,6 +698,12 @@ def build_parser():
     parser.add_argument("--tree-broad-width", type=int, default=4)
     parser.add_argument("--tree-shallow-depth", type=int, default=3)
     parser.add_argument("--tree-node-budget", type=int, default=63)
+    parser.add_argument(
+        "--recycling-fusion-rule",
+        choices=("none", "fixed", "prior_confidence"),
+        default="none",
+        help="Row-fusion rule; none keeps the production fixed prior.",
+    )
     parser.add_argument("--cover-num-probes", type=int, default=4)
     parser.add_argument("--cover-anchor-fraction", type=float, default=0.5)
     parser.add_argument(

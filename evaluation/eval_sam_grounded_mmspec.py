@@ -48,6 +48,10 @@ from evaluation.utils import (
 from method.sam_grounded.spec_model import SpecModel
 from method.sam_grounded.recycling_model import RecyclingSpecModel
 from method.sam_grounded.tree_recycling_model import TreeRecyclingSpecModel
+from method.sam_grounded.official_token_recycling_model import OfficialTokenRecyclingSpecModel
+from method.sam_grounded.fusion_weighting import FusionRule
+from method.pld.spec_model_pld import SpecModel as PLDSpecModel
+from method.lookahead.spec_model_lookahead import SpecModel as LookaheadSpecModel
 
 
 def _token_hash(output_ids: torch.Tensor, input_len: int) -> str:
@@ -69,11 +73,14 @@ def _parse_policies(value: str):
         policy[len("cover-") :] if policy.startswith("cover-") else policy
         for policy in policies
     }
-    unknown = normalized - GroundedDraftController.POLICIES
+    allowed = GroundedDraftController.POLICIES | {
+        "pld", "lookahead", "token-recycling-official"
+    }
+    unknown = normalized - allowed
     if not policies or unknown:
         raise argparse.ArgumentTypeError(
             f"Invalid policies {sorted(unknown)}; choose from "
-            f"{sorted(GroundedDraftController.POLICIES)}"
+            f"{sorted(allowed)}"
         )
     return policies
 
@@ -107,6 +114,17 @@ def _sample_order_indices(num_samples: int, seed=None):
 
 
 def _policy_kwargs(args, policy):
+    if args.draft_engine in ("pld", "lookahead"):
+        if policy == "target":
+            return {"draft_policy": "target"}
+        if policy != args.draft_engine:
+            raise ValueError(f"Policy {policy!r} does not match {args.draft_engine!r}")
+        if policy == "pld":
+            return {"pld_ngram": args.pld_ngram, "pld_n_pred": args.pld_n_pred}
+        return {
+            "decoding_length": args.lookahead_decoding_length,
+            "branch_length": args.lookahead_branch_length,
+        }
     values = {
         "draft_policy": policy,
         "min_draft_tokens": args.min_draft_tokens,
@@ -127,6 +145,9 @@ def _policy_kwargs(args, policy):
             getattr(args, "candidate_trace_diagnostics", False)
         )
     if args.draft_engine == "tree-recycling":
+        fusion_rule = getattr(args, "recycling_fusion_rule", "none")
+        if fusion_rule != "none" and policy != "target":
+            values["recycling_fusion_rule"] = FusionRule(fusion_rule)
         values.update(
             {
                 "selective_reuse_diagnostics": bool(
@@ -194,6 +215,9 @@ def evaluate(args):
         "sam": SpecModel,
         "recycling": RecyclingSpecModel,
         "tree-recycling": TreeRecyclingSpecModel,
+        "token-recycling-official": OfficialTokenRecyclingSpecModel,
+        "pld": PLDSpecModel,
+        "lookahead": LookaheadSpecModel,
     }
     model_class = model_classes[args.draft_engine]
     model = model_class.from_pretrained(
@@ -239,6 +263,13 @@ def evaluate(args):
     tokenizer = model.get_tokenizer()
     model.eval()
     tracker = build_time_breakdown_tracker(model)
+    target_model = model
+    if args.draft_engine in ("pld", "lookahead"):
+        # Use the existing autoregressive reference on the same loaded weights.
+        target_model = TreeRecyclingSpecModel(
+            model.base_model, args.base_model_path, total_token=args.total_token
+        ).eval()
+        tracker.install_phase_fallback_hooks(target_model)
 
     data = load_mmspec_data(args.data_folder)
     wrong_image_source_data = data
@@ -325,6 +356,7 @@ def evaluate(args):
         f"{qshape_exact_root_attention_layers}"
     )
     print(f"policy_trace_enabled={not args.no_policy_trace}")
+    print(f"recycling_fusion_rule={args.recycling_fusion_rule}")
     print(
         "selective_reuse_diagnostics="
         f"{args.selective_reuse_diagnostics}"
@@ -361,10 +393,11 @@ def evaluate(args):
 
     print("Warming up policies...")
     for policy in args.policies:
+        policy_model = target_model if policy == "target" else model
         for warmup_idx in range(args.warmup_runs):
             torch.manual_seed(warmup_idx)
             model_inputs = build_prompt(data[0], args)
-            model.specgenerate(
+            policy_model.specgenerate(
                 **model_inputs,
                 temperature=args.temperature,
                 max_new_tokens=min(args.max_new_token, args.warmup_tokens),
@@ -376,6 +409,8 @@ def evaluate(args):
     )
     if callable(reset_persistent_cache):
         reset_persistent_cache()
+    if args.draft_engine == "lookahead":
+        model.lookahead_cache = type(model.lookahead_cache)()
     print("Warmup done")
 
     active_split = None
@@ -400,6 +435,7 @@ def evaluate(args):
         for policy in policy_order:
             if sample["id"] in existing_ids[policy]:
                 continue
+            policy_model = target_model if policy == "target" else model
             choices = []
             num_turns = get_num_turns(sample)
 
@@ -431,7 +467,7 @@ def evaluate(args):
                     torch.cuda.synchronize()
                     tracker.reset()
                     started = time.perf_counter()
-                    result = model.specgenerate(
+                    result = policy_model.specgenerate(
                         **model_inputs,
                         temperature=args.temperature,
                         max_new_tokens=args.max_new_token,
@@ -623,7 +659,7 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument(
         "--draft-engine",
-        choices=["sam", "recycling", "tree-recycling"],
+        choices=["sam", "recycling", "tree-recycling", "token-recycling-official", "pld", "lookahead"],
         default="sam",
     )
     parser.add_argument(
@@ -634,6 +670,10 @@ def main():
         ),
     )
     parser.add_argument("--total-token", type=int, default=40)
+    parser.add_argument("--pld-ngram", type=int, default=4)
+    parser.add_argument("--pld-n-pred", type=int, default=10)
+    parser.add_argument("--lookahead-decoding-length", type=int, default=64)
+    parser.add_argument("--lookahead-branch-length", type=int, default=12)
     parser.add_argument("--min-draft-tokens", type=int, default=2)
     parser.add_argument("--max-draft-tokens", type=int, default=40)
     parser.add_argument("--matrix-top-k", type=int, default=4)
@@ -642,6 +682,12 @@ def main():
     parser.add_argument("--tree-broad-width", type=int, default=4)
     parser.add_argument("--tree-shallow-depth", type=int, default=2)
     parser.add_argument("--tree-node-budget", type=int, default=31)
+    parser.add_argument(
+        "--recycling-fusion-rule",
+        choices=("none", "fixed", "prior_confidence"),
+        default="none",
+        help="Row-fusion rule; none keeps the production fixed prior.",
+    )
     parser.add_argument("--cover-num-probes", type=int, default=4)
     parser.add_argument("--cover-anchor-fraction", type=float, default=0.5)
     parser.add_argument("--cover-probe-visual-threshold", type=float, default=0.75)
@@ -845,6 +891,16 @@ def main():
     )
     parser.set_defaults(rotate_policy_order=True)
     args = parser.parse_args()
+    if args.draft_engine in ("pld", "lookahead"):
+        if set(args.policies) != {"target", args.draft_engine}:
+            parser.error(f"--draft-engine {args.draft_engine} requires --policies target,{args.draft_engine}")
+        args.no_policy_trace = True
+        if args.attn_implementation != "eager":
+            parser.error("PLD/Lookahead paired evaluation requires --attn-implementation eager")
+    elif set(args.policies) & {"pld", "lookahead"}:
+        parser.error("PLD/Lookahead policies require their matching --draft-engine")
+    if min(args.pld_ngram, args.pld_n_pred, args.lookahead_decoding_length, args.lookahead_branch_length) <= 0:
+        parser.error("PLD/Lookahead proposal lengths must be positive")
     if args.visual_lexical_pool_size <= 0:
         parser.error("--visual-lexical-pool-size must be positive")
     if args.visual_lexical_width <= 0:

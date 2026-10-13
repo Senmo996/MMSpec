@@ -18,14 +18,22 @@ import numpy as np
 import torch
 
 import eval_recap_memory_source as source
+from method.sam.samd.sam_draft import DraftModel
 
 Model = source.TreeRecyclingSpecModel
 MODES = ("U", "backoff", "uniform", "fusion")
+MODE_TO_BUILDER = {
+    "U": "strict", "backoff": "strict", "uniform": "fusion_uniform", "fusion": "fusion",
+    "fusion_mass": "fusion_mass", "uniform_mass": "fusion_uniform_mass", "agreement": "fusion_agreement",
+    "UC": "strict", "backoff_suffix": "strict", "fusion_suffix": "fusion",
+}
 PROTOCOL = "recap_past_only_same_trajectory_path_coverage_v1"
+CACHED_PROTOCOL = "recap_cached_path_variant_comparison_v1"
 
 
-def build_paths(tokens, position, rows, scores, mode, width, depth, budget, blocked):
-    flat, _, _, paths = Model._build_tree(
+def build_paths(tokens, position, rows, scores, mode, width, depth, budget, blocked, suffix_tokens=None):
+    max_order = 1 if mode == "U" else (2 if mode == "UC" else 3)
+    flat, _, _, paths = Model._build_tree_budgeted(
         root_token=tokens[position],
         transitions=torch.empty(0, dtype=torch.long),
         transition_valid=torch.empty(0, dtype=torch.bool),
@@ -33,12 +41,13 @@ def build_paths(tokens, position, rows, scores, mode, width, depth, budget, bloc
         host_transitions=rows[1], host_transition_scores=scores[1],
         root_previous_token=tokens[position - 1] if position >= 1 else None,
         root_previous_previous_token=tokens[position - 2] if position >= 2 else None,
-        host_context_transitions=rows[2] if mode != "U" else None,
-        host_context_transition_scores=scores[2] if mode != "U" else None,
-        host_trigram_transitions=rows[3] if mode != "U" else None,
-        host_trigram_transition_scores=scores[3] if mode != "U" else None,
-        context_candidate_mode={"uniform": "fusion_uniform", "fusion": "fusion"}.get(mode, "strict"),
+        host_context_transitions=rows[2] if max_order >= 2 else None,
+        host_context_transition_scores=scores[2] if max_order >= 2 else None,
+        host_trigram_transitions=rows[3] if max_order >= 3 else None,
+        host_trigram_transition_scores=scores[3] if max_order >= 3 else None,
+        context_candidate_mode=MODE_TO_BUILDER[mode],
         score_priority_layout=True,
+        reserved_path_tokens=suffix_tokens if mode.endswith("_suffix") else None,
     )
     if len(paths) != len(flat) - 1 or len(paths) > budget:
         raise ValueError("unexpected production tree node count")
@@ -48,24 +57,30 @@ def build_paths(tokens, position, rows, scores, mode, width, depth, budget, bloc
     return Model._tree_path_token_ids(flat, paths)
 
 
-def replay_paths(tokens, prompt_length, prediction_rows, width, depth, node_cap, blocked):
+def replay_paths(tokens, prompt_length, prediction_rows, width, depth, node_cap, blocked, modes=MODES, memory_init="unigram"):
     """Build from past rows only; look at the future solely to score frozen trees."""
     rows, scores = ({order: {} for order in (1, 2, 3)} for _ in range(2))
-    prompt_positions, _ = Model._select_prompt_transition_rows(tokens[:prompt_length])
+    if memory_init not in ("none", "unigram"):
+        raise ValueError("memory_init must be none or unigram")
+    prompt_positions, _ = Model._select_prompt_transition_rows(tokens[:prompt_length]) if memory_init == "unigram" else ([], [])
     for position in prompt_positions:
         if tokens[position] != blocked:
             rows[1][tokens[position]], scores[1][tokens[position]] = prediction_rows[position]
+    suffix = DraftModel(device="cpu") if any(mode.endswith("_suffix") for mode in modes) else None
+    if suffix is not None:
+        suffix.update_tokens(tokens[:prompt_length + 1])
     states = []
     for position in range(prompt_length, len(tokens) - 1):
+        suffix_tokens = suffix.lookup_tokens(tokens[position])[0][:4] if suffix is not None else []
         cap_paths = {
-            mode: build_paths(tokens, position, rows, scores, mode, width, depth, node_cap, blocked)
-            for mode in MODES
+            mode: build_paths(tokens, position, rows, scores, mode, width, depth, node_cap, blocked, suffix_tokens)
+            for mode in modes
         }
         budget = min(len(paths) for paths in cap_paths.values())
         # Packed order is DFS, NOT score selection order. Rebuild; do not slice.
         equal_paths = {
             mode: paths if len(paths) == budget else build_paths(
-                tokens, position, rows, scores, mode, width, depth, budget, blocked
+                tokens, position, rows, scores, mode, width, depth, budget, blocked, suffix_tokens
             )
             for mode, paths in cap_paths.items()
         }
@@ -78,9 +93,13 @@ def replay_paths(tokens, prompt_length, prediction_rows, width, depth, node_cap,
                 break
             agreement_prefix += 1
         methods = {}
-        for mode in MODES:
+        for mode in modes:
             length = Model._longest_matching_path(equal_paths[mode], future)
+            root_paths = build_paths(tokens, position, rows, scores, mode, width, 1, width, blocked, suffix_tokens)
+            root_candidates = {path[0] for path in root_paths}
             methods[mode] = {
+                "query_available": bool(root_candidates),
+                "root_hit": future[0] in root_candidates,
                 "nodes_at_cap": len(cap_paths[mode]),
                 "match_length_at_cap": Model._longest_matching_path(cap_paths[mode], future),
                 "matched_nodes": len(equal_paths[mode]),
@@ -88,6 +107,19 @@ def replay_paths(tokens, prompt_length, prediction_rows, width, depth, node_cap,
                 "tf_supported_match_length": min(length, agreement_prefix),
                 "matched_tree_sha256": hashlib.sha256(json.dumps(equal_paths[mode]).encode()).hexdigest(),
             }
+        order_candidates = {}
+        for order in (1, 2, 3):
+            key = tokens[position] if order == 1 else tuple(tokens[position + 1 - order:position + 1])
+            candidates = [token for token in rows[order].get(key, [])[:width] if token != blocked]
+            order_candidates[str(order)] = {"available": bool(candidates), "hit": future[0] in candidates}
+        suffix_only = {}
+        if suffix is not None:
+            flat, _, _, paths = Model._build_tree_budgeted(
+                tokens[position], torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.bool),
+                width, depth, node_cap, blocked, host_transitions={}, score_priority_layout=True,
+                reserved_path_tokens=suffix_tokens,
+            )
+            suffix_only = {"nodes": len(paths), "match_length": Model._longest_matching_path(Model._tree_path_token_ids(flat, paths), future)}
         states.append({
             "position": position, "generated_offset": position + 1 - prompt_length,
             "available_future_tokens": len(tokens) - position - 1,
@@ -95,16 +127,20 @@ def replay_paths(tokens, prompt_length, prediction_rows, width, depth, node_cap,
             "tf_native_first_token_agrees": prediction_rows[position][0][0] == future[0],
             "tf_native_agreement_prefix_length": agreement_prefix,
             "modes": methods,
+            "order_candidates": order_candidates,
+            "suffix_only": suffix_only,
         })
         # No current or uncommitted branch logits enter any of the trees above.
         for order in (1, 2, 3):
             if position + 1 >= order:
                 key = tokens[position] if order == 1 else tuple(tokens[position + 1 - order:position + 1])
                 rows[order][key], scores[order][key] = prediction_rows[position]
+        if suffix is not None:
+            suffix.update_tokens([tokens[position + 1]])
     return states
 
 
-def summarize(records, depth, node_cap, resamples, seed):
+def summarize(records, depth, node_cap, resamples, seed, modes=MODES):
     grouped = defaultdict(list)
     for record in records:
         grouped[record["dataset"]].append(record)
@@ -114,9 +150,16 @@ def summarize(records, depth, node_cap, resamples, seed):
         if not states:
             raise ValueError(f"no diagnostic states for {dataset}")
         methods = {}
-        for mode in MODES:
+        for mode in modes:
             lengths = np.array([s["modes"][mode]["match_length"] for s in states])
             methods[mode] = {
+                "query_coverage": float(np.mean([s["modes"][mode]["query_available"] for s in states])),
+                "root_recall": float(np.mean([s["modes"][mode]["root_hit"] for s in states])),
+                "conditional_root_recall": (
+                    sum(s["modes"][mode]["root_hit"] for s in states) /
+                    sum(s["modes"][mode]["query_available"] for s in states)
+                    if any(s["modes"][mode]["query_available"] for s in states) else None
+                ),
                 "avg_match_length_equal_nodes": float(lengths.mean()),
                 "median_match_length_equal_nodes": float(np.median(lengths)),
                 "p90_match_length_equal_nodes": float(np.quantile(lengths, 0.9)),
@@ -129,7 +172,16 @@ def summarize(records, depth, node_cap, resamples, seed):
                 "avg_nodes_at_cap": float(np.mean([s["modes"][mode]["nodes_at_cap"] for s in states])),
             }
         comparisons = {}
-        for left, right in (("backoff", "U"), ("fusion", "U"), ("uniform", "backoff"), ("fusion", "backoff")):
+        pairs = [("backoff", "U"), ("fusion", "U"), ("uniform", "backoff"), ("fusion", "backoff")]
+        pairs += [(mode, baseline) for mode in ("fusion_mass", "uniform_mass", "agreement")
+                  for baseline in ("backoff", "fusion")]
+        pairs += [("agreement", "uniform_mass")]
+        pairs += [("UC", "U"), ("backoff", "UC"),
+                  ("backoff_suffix", "backoff"), ("fusion_suffix", "fusion"),
+                  ("fusion_suffix", "backoff_suffix")]
+        for left, right in pairs:
+            if left not in modes or right not in modes:
+                continue
             clusters = defaultdict(lambda: np.zeros(7))
             for sample in samples:
                 counts = clusters[sample["target_image_identity"]]
@@ -174,7 +226,47 @@ def summarize(records, depth, node_cap, resamples, seed):
             "recomputed_tf_matches_source_reference_ratio": sum(s["num_source_reference_agreements"] for s in samples) / len(states),
             "future_shorter_than_depth_ratio": sum(s["available_future_tokens"] < depth for s in states) / len(states),
             "modes": methods, "paired_comparisons": comparisons,
+            "orders": {
+                order: {
+                    "query_coverage": float(np.mean([s["order_candidates"][order]["available"] for s in states])),
+                    "conditional_recall": (
+                        sum(s["order_candidates"][order]["hit"] for s in states) /
+                        sum(s["order_candidates"][order]["available"] for s in states)
+                        if any(s["order_candidates"][order]["available"] for s in states) else None
+                    ),
+                } for order in ("1", "2", "3")
+            },
         }
+        common_order_queries = {}
+        for left, right in (("2", "1"), ("3", "1"), ("3", "2")):
+            clusters = defaultdict(lambda: np.zeros(2))
+            for sample in samples:
+                counts = clusters[sample["target_image_identity"]]
+                for state in sample["states"]:
+                    a, b = (state["order_candidates"][order] for order in (left, right))
+                    if a["available"] and b["available"]:
+                        counts += (int(a["hit"]) - int(b["hit"]), 1)
+            values = np.array(list(clusters.values()))
+            total = values.sum(axis=0)
+            rng = np.random.default_rng(seed)
+            draws = np.array([values[rng.integers(len(values), size=len(values))].sum(axis=0) for _ in range(resamples)])
+            valid = draws[:, 1] > 0
+            common_order_queries[f"order{left}_minus_order{right}"] = {
+                "num_common_queries": int(total[1]), "root_recall_delta": float(total[0] / total[1]) if total[1] else None,
+                "paired_image_cluster_bootstrap_95_ci": np.quantile(draws[valid, 0] / draws[valid, 1], [.025, .975]).tolist()
+                if len(values) >= 2 and valid.any() else None,
+                "valid_bootstrap_draws": int(valid.sum()),
+            }
+        datasets[dataset]["common_order_queries"] = common_order_queries
+        if states[0]["suffix_only"]:
+            datasets[dataset]["suffix_only"] = {
+                "avg_nodes": float(np.mean([s["suffix_only"]["nodes"] for s in states])),
+                "avg_match_length_at_cap": float(np.mean([s["suffix_only"]["match_length"] for s in states])),
+                "unique_first_hit_vs_fusion_ratio": float(np.mean([
+                    s["suffix_only"]["match_length"] > 0 and s["modes"]["fusion"]["match_length_at_cap"] == 0 for s in states
+                ])) if "fusion" in modes else None,
+                "note": "standalone suffix has at most 4 real nodes; not padded or forced into the matched transition-tree comparison",
+            }
     return {
         "protocol": PROTOCOL, "num_records": len(records),
         "num_states": sum(len(r["states"]) for r in records),
@@ -182,7 +274,7 @@ def summarize(records, depth, node_cap, resamples, seed):
         "diagnostic_only": True, "formal_speedup_evaluated": False,
         "packed_tree_verification_evaluated": False,
         "metric": "longest tree prefix matching the saved native greedy continuation; excludes root and correction",
-        "budget_matching": "minimum actual candidate count across four cap trees; rebuild every larger tree at that budget",
+        "budget_matching": f"minimum actual candidate count across {len(modes)} cap trees; rebuild every larger tree at that budget",
         "tf_supported_metric": "matched native path clipped at first TF/native disagreement; not a coherent alternative rollout",
         "aggregation": "all states including empty banks, state weighted within each benchmark; no pooled headline",
         "bootstrap_scope": "paired target-image clusters; exploratory, conditional on saved trajectories",
@@ -236,7 +328,7 @@ def evaluate(args):
               "code_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (
                   Path(__file__), source.MMSPEC_ROOT / "method/sam_grounded/tree_recycling_model.py",
                   source.MMSPEC_ROOT / "evaluation/selective_reuse_protocol.py",
-                  source.MMSPEC_ROOT.parent / "new_dream/evaluation/eval_llava_fixed_multi.py")}}
+                  source.MMSPEC_ROOT.parent / "method/fovea/evaluation/eval_llava_fixed_multi.py")}}
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "run_config.json").write_text(json.dumps(config, indent=2) + "\n")
     planned = sum(len(item[3]) for item in payloads)
@@ -304,6 +396,72 @@ def evaluate(args):
     print(f"completed_summary={output_root / 'summary.json'}", flush=True)
 
 
+def evaluate_cached(args):
+    """Replay saved prediction rows on CPU; no model, data download or GPU work."""
+    torch.set_num_threads(1)
+    source_root, output_root = Path(args.source_root), Path(args.output_root)
+    if (output_root / "run_config.json").exists() or (output_root / "results.jsonl").exists():
+        raise FileExistsError("use a fresh output directory")
+    previous = json.loads((source_root / "run_config.json").read_text())
+    previous_summary = json.loads((source_root / "summary.json").read_text())
+    if previous["protocol"] != PROTOCOL or not previous_summary.get("complete"):
+        raise ValueError("require a complete saved-row path-coverage run")
+    source_jsonl = source_root / "results.jsonl"
+    original = [json.loads(line) for line in source_jsonl.read_text().splitlines() if line.strip()]
+    if len(original) != previous_summary["num_records"] or len({r["question_id"] for r in original}) != len(original):
+        raise ValueError("source record count or uniqueness check failed")
+    counts = defaultdict(int)
+    chosen = []
+    for record in original:
+        if counts[record["dataset"]] < args.samples_per_benchmark:
+            chosen.append(record)
+            counts[record["dataset"]] += 1
+    if set(counts) != set(previous_summary["datasets"]) or any(n != args.samples_per_benchmark for n in counts.values()):
+        raise ValueError("insufficient saved rows for requested sample count")
+    config = {**vars(args), "protocol": CACHED_PROTOCOL, "source_config": previous,
+              "source_jsonl_sha256": hashlib.sha256(source_jsonl.read_bytes()).hexdigest(),
+              "development_only": True, "held_out_confirmation": False,
+              "normalization_note": "topk renormalizes saved full-vocabulary probabilities over the stored K; mathematically equivalent to softmax of topk logits, not asserted bit-identical",
+              "code_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (
+                  Path(__file__), source.MMSPEC_ROOT / "method/sam_grounded/tree_recycling_model.py",
+                  source.MMSPEC_ROOT / "method/sam_grounded/controller.py")}}
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "run_config.json").write_text(json.dumps(config, indent=2) + "\n")
+    print(f"protocol={CACHED_PROTOCOL} device=cpu source={source_root} planned_records={len(chosen)}", flush=True)
+    print(f"modes={args.modes} score_normalization={args.score_normalization} development_only=true", flush=True)
+    records = []
+    output_path = output_root / "results.jsonl"
+    with output_path.open("x", encoding="utf-8") as handle:
+        for index, saved in enumerate(chosen):
+            started = time.perf_counter()
+            tokens, prompt_length = saved["input_token_ids"], saved["prompt_length"]
+            if hashlib.sha256(json.dumps(tokens[prompt_length:]).encode()).hexdigest() != saved["output_token_sha256"]:
+                raise ValueError("cached trajectory hash mismatch")
+            prediction_rows = {}
+            for position, ids, probabilities in saved["prediction_rows"]:
+                values = np.asarray(probabilities)
+                if position in prediction_rows or len(ids) != len(set(ids)) or len(ids) != len(values) or not np.isfinite(values).all() or (values < 0).any() or values.sum() <= 0:
+                    raise ValueError("invalid cached prediction row")
+                scores = (values / values.sum()).tolist() if args.score_normalization == "topk" else probabilities
+                prediction_rows[position] = (ids, scores)
+            states = replay_paths(tokens, prompt_length, prediction_rows, previous["source_config"]["top_k"],
+                                  args.depth, args.node_cap, saved["blocked_token_id"], args.modes, args.memory_init)
+            record = {key: saved[key] for key in ("dataset", "question_id", "target_image_identity", "output_token_sha256", "num_source_reference_agreements")}
+            record.update(protocol=CACHED_PROTOCOL, states=states, diagnostic_wall_seconds=time.perf_counter() - started)
+            handle.write(json.dumps(record) + "\n")
+            handle.flush()
+            records.append(record)
+            print(f"record={len(records)}/{len(chosen)} dataset={record['dataset']} states={len(states)} elapsed={record['diagnostic_wall_seconds']:.2f}s", flush=True)
+            if index + 1 == len(chosen) or chosen[index + 1]["dataset"] != saved["dataset"]:
+                summary = summarize(records, args.depth, args.node_cap, args.bootstrap_resamples,
+                                    previous["source_config"]["seed"], args.modes)
+                summary.update(protocol=CACHED_PROTOCOL, complete=len(records) == len(chosen),
+                               jsonl_path=str(output_path), score_normalization=args.score_normalization,
+                               development_only=True, source_root=str(source_root), memory_init=args.memory_init)
+                (output_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"completed_summary={output_root / 'summary.json'}", flush=True)
+
+
 def self_test():
     tokens = [1, 2, 3, 4, 1, 2, 3, 4, 5]
     rows = {p: ([{1: 2, 2: 3, 3: 4, 4: 5, 5: 6}[token], 90 + token], [0.8, 0.1]) for p, token in enumerate(tokens)}
@@ -331,6 +489,14 @@ def self_test():
     assert summary["num_states"] == 4
     assert summary["datasets"]["test"]["paired_comparisons"]["fusion_minus_U"]["match_length"]["delta"] == 0
     assert not summary["packed_tree_verification_evaluated"]
+    variants = tuple(MODE_TO_BUILDER)
+    expanded = replay_paths(tokens, 4, rows, 2, 4, 5, -1, variants)
+    later_changed = replay_paths(tokens, 4, changed, 2, 4, 5, -1, variants)
+    assert set(expanded[0]["modes"]) == set(variants)
+    assert all(expanded[0]["modes"][m]["matched_tree_sha256"] == later_changed[0]["modes"][m]["matched_tree_sha256"] for m in variants)
+    assert all(row["matched_nodes"] == state["matched_node_budget"] for state in expanded for row in state["modes"].values())
+    variant_summary = summarize([{**sample, "states": expanded}], 4, 5, 10, 42, variants)
+    assert "agreement_minus_uniform_mass" in variant_summary["datasets"]["test"]["paired_comparisons"]
     print("self_test=passed")
 
 
@@ -343,10 +509,22 @@ if __name__ == "__main__":
     parser.add_argument("--node-cap", type=int, default=63)
     parser.add_argument("--bootstrap-resamples", type=int, default=2000)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--cached-rows", action="store_true")
+    parser.add_argument("--score-normalization", choices=("full-vocab", "topk"), default="full-vocab")
+    parser.add_argument("--modes", default=",".join(MODES))
+    parser.add_argument("--memory-init", choices=("unigram", "none"), default="unigram")
     args = parser.parse_args()
     if args.self_test:
         self_test()
     else:
         if not args.source_root or not args.output_root or min(args.samples_per_benchmark, args.depth, args.node_cap, args.bootstrap_resamples) < 1:
             parser.error("require source-root, output-root, and positive counts")
-        evaluate(args)
+        args.modes = tuple(args.modes.split(","))
+        if len(set(args.modes)) != len(args.modes) or not set(args.modes) <= set(MODE_TO_BUILDER):
+            parser.error("choose distinct supported modes")
+        if args.cached_rows:
+            evaluate_cached(args)
+        else:
+            if args.modes != MODES or args.score_normalization != "full-vocab" or args.memory_init != "unigram":
+                parser.error("custom modes/normalization currently require --cached-rows")
+            evaluate(args)

@@ -24,7 +24,7 @@ def _load_extension():
     )
     build_root.mkdir(parents=True, exist_ok=True)
     _EXTENSION = load(
-        name="gwtr_tree_builder_v1",
+        name="gwtr_tree_builder_v2",
         sources=[str(source)],
         extra_cflags=["-O3", "-std=c++17"],
         build_directory=str(build_root),

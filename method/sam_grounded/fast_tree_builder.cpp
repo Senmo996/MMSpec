@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <queue>
@@ -105,6 +106,28 @@ CandidateDistribution read_distribution(
   return result;
 }
 
+// Inverse perplexity of a retained row; mirrors fusion_weighting.concentration.
+double concentration(const std::vector<double>& probabilities) {
+  double total = 0.0;
+  for (const double value : probabilities) {
+    total += value;
+  }
+  if (probabilities.empty() || !(total > 0.0) || !std::isfinite(total)) {
+    throw std::invalid_argument("concentration requires a nonempty positive row");
+  }
+  double negative_entropy = 0.0;
+  for (const double value : probabilities) {
+    const double probability = value / total;
+    if (probability < 0.0 || !std::isfinite(probability)) {
+      throw std::invalid_argument("invalid prediction probabilities");
+    }
+    if (probability > 0.0) {
+      negative_entropy += probability * std::log(probability);
+    }
+  }
+  return std::exp(negative_entropy);
+}
+
 CandidateDistribution candidate_distribution(
     std::int64_t parent_token,
     std::int64_t previous_token,
@@ -115,7 +138,8 @@ CandidateDistribution candidate_distribution(
     const py::dict& context_rows,
     const py::dict& context_scores,
     const py::dict& trigram_rows,
-    const py::dict& trigram_scores) {
+    const py::dict& trigram_scores,
+    bool confidence_weighting) {
   std::vector<CandidateDistribution> sources;
   sources.reserve(3);
 
@@ -169,9 +193,12 @@ CandidateDistribution candidate_distribution(
 
   for (std::size_t source_index = 0; source_index < sources.size();
        ++source_index) {
-    const double weight = source_weights[std::min<std::size_t>(
-        source_index, source_weights.size() - 1)];
     const auto& source = sources[source_index];
+    double weight = source_weights[std::min<std::size_t>(
+        source_index, source_weights.size() - 1)];
+    if (confidence_weighting) {
+      weight = concentration(source.probabilities) * weight;
+    }
     for (std::size_t index = 0; index < source.candidates.size(); ++index) {
       const auto candidate = source.candidates[index];
       auto [iterator, inserted] = candidate_indices.emplace(
@@ -234,7 +261,13 @@ std::vector<std::array<std::int64_t, 4>> build_score_priority_nodes(
     const py::dict& context_scores,
     const py::dict& trigram_rows,
     const py::dict& trigram_scores,
-    const std::vector<double>& hit_masses) {
+    const std::vector<double>& hit_masses,
+    const std::vector<std::int64_t>& root_backoff_candidates,
+    const std::vector<double>& root_backoff_scores,
+    bool confidence_weighting) {
+  if (root_backoff_candidates.size() != root_backoff_scores.size()) {
+    throw std::invalid_argument("root backoff candidates and scores must align");
+  }
   if (width <= 0 || branch_width <= 0 || depth <= 0 || node_budget <= 0) {
     return {};
   }
@@ -276,7 +309,13 @@ std::vector<std::array<std::int64_t, 4>> build_score_priority_nodes(
         context_rows,
         context_scores,
         trigram_rows,
-        trigram_scores);
+        trigram_scores,
+        confidence_weighting);
+    if (parent_path.empty() && distribution.candidates.empty()) {
+      const auto count = std::min(root_backoff_candidates.size(), static_cast<std::size_t>(level_width));
+      distribution.candidates.assign(root_backoff_candidates.begin(), root_backoff_candidates.begin() + count);
+      distribution.probabilities.assign(root_backoff_scores.begin(), root_backoff_scores.begin() + count);
+    }
     const double hit_mass = hit_masses[std::min<std::size_t>(
         current_depth - 1, hit_masses.size() - 1)];
     std::set<std::int64_t> seen_candidates;
@@ -378,5 +417,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       py::arg("context_scores"),
       py::arg("trigram_rows"),
       py::arg("trigram_scores"),
-      py::arg("hit_masses"));
+      py::arg("hit_masses"),
+      py::arg("root_backoff_candidates") = std::vector<std::int64_t>{},
+      py::arg("root_backoff_scores") = std::vector<double>{},
+      py::arg("confidence_weighting") = false);
 }

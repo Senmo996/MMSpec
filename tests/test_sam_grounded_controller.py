@@ -978,6 +978,9 @@ def test_fourgram_score_tree_precedes_trigram_and_records_three_token_context():
         ("fusion", [0, 1, 2, 3, 5]),
         ("fusion55", [0, 1, 2, 5, 3]),
         ("fusion_adaptive", [0, 1, 2, 5, 3]),
+        ("fusion_mass", [0, 1, 2, 3, 5]),
+        ("fusion_uniform_mass", [0, 1, 5, 7, 2]),
+        ("fusion_agreement", [0, 1, 2, 3, 4]),
     ],
 )
 def test_context_candidate_modes_mix_lower_order_fallbacks(
@@ -1013,6 +1016,46 @@ def test_context_candidate_modes_mix_lower_order_fallbacks(
     )
 
     assert tokens == expected_tokens
+
+
+def test_agreement_fusion_only_admits_matching_lower_order_sources():
+    kwargs = dict(
+        root_token=0, transitions=torch.empty(0, dtype=torch.long),
+        transition_valid=torch.empty(0, dtype=torch.bool),
+        width=4, depth=1, node_budget=4, blocked_token_id=None,
+        host_transitions={0: [7, 8, 1, 2]},
+        host_transition_scores={0: [0.6, 0.2, 0.1, 0.1]},
+        root_previous_token=9, root_previous_previous_token=8,
+        host_context_transitions={(9, 0): [1, 5, 6, 2]},
+        host_context_transition_scores={(9, 0): [0.6, 0.2, 0.1, 0.1]},
+        host_trigram_transitions={(8, 9, 0): [1, 2, 3, 4]},
+        host_trigram_transition_scores={(8, 9, 0): [0.4, 0.3, 0.2, 0.1]},
+        score_priority_layout=True,
+    )
+    build = TreeRecyclingSpecModel._build_tree
+    assert build(**kwargs, context_candidate_mode="fusion_agreement")[0] == [0, 1, 2, 3, 5]
+    # A shared blocked token is not evidence of usable candidate agreement.
+    kwargs["blocked_token_id"] = 1
+    assert build(**kwargs, context_candidate_mode="fusion_agreement")[0] == [0, 2, 3, 4]
+    kwargs["host_trigram_transitions"] = {}
+    kwargs["host_context_transitions"] = {}
+    assert build(**kwargs, context_candidate_mode="fusion_agreement")[0] == build(**kwargs, context_candidate_mode="strict")[0]
+
+
+def test_mass_preserving_fusion_does_not_inflate_truncated_child_scores():
+    kwargs = dict(
+        root_token=0, transitions=torch.empty(0, dtype=torch.long),
+        transition_valid=torch.empty(0, dtype=torch.bool),
+        width=2, depth=2, node_budget=3, blocked_token_id=None,
+        host_transitions={0: [1, 2], 1: [4, 5], 2: [7, 8]},
+        host_transition_scores={0: [0.5, 0.5], 1: [0.6, 0.4], 2: [0.4, 0.3]},
+        host_context_transitions={(0, 1): [3, 6]},
+        host_context_transition_scores={(0, 1): [0.6, 0.4]},
+        score_priority_layout=True,
+    )
+    build = TreeRecyclingSpecModel._build_tree
+    assert build(**kwargs, context_candidate_mode="fusion_uniform")[0] == [0, 1, 3, 2]
+    assert build(**kwargs, context_candidate_mode="fusion_uniform_mass")[0] == [0, 1, 2, 7]
 
 
 def test_global_candidates_only_fill_an_unseen_host_row():
@@ -1367,6 +1410,9 @@ def test_matched_budget_controls_share_tree_shape_and_node_cap():
         "context-score-trigram-strict-depth10-node63-wide8",
         "context-score-trigram-fusion-uniform-depth10-node63-wide8",
         "context-score-trigram-fusion-depth10-node63-wide8",
+        "context-score-trigram-fusion-mass-depth10-node63-wide8",
+        "context-score-trigram-fusion-uniform-mass-depth10-node63-wide8",
+        "context-score-trigram-fusion-agreement-depth10-node63-wide8",
         "context-score-trigram-fusion-persistent-depth10-node63-wide8",
     )
     common = (0.0, 1.0, 0.0, 0.55, 0.75, 2, 4, 4, 3)

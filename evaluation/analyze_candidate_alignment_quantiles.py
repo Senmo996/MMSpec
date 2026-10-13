@@ -223,7 +223,13 @@ def signed_support_margin(payload: dict) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
-def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> None:
+def render(
+    payload: dict,
+    output_stem: Path,
+    *,
+    signed_margin: bool = False,
+    title: str | None = None,
+) -> None:
     point = payload["point_estimates"]
     intervals = payload["cluster_bootstrap_95_ci"]
     num_bins = int(payload["num_bins"])
@@ -252,8 +258,8 @@ def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> 
         axis.axhline(0.0, color=INK, linewidth=0.85, zorder=2)
     else:
         for offset, prefix, facecolor, edgecolor, label in (
-            (-width / 2, "u", U_FILL, U_EDGE, "Token-only reuse"),
-            (width / 2, "gc", GC_FILL, GC_EDGE, "Context-aware reuse"),
+            (-width / 2, "u", U_FILL, U_EDGE, "Token-only"),
+            (width / 2, "gc", GC_FILL, GC_EDGE, "Contextual"),
         ):
             values = np.asarray(point[f"{prefix}_relative_support"], dtype=float)
             _rounded_bars(
@@ -268,7 +274,7 @@ def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> 
         axis.set_ylim(0.0, 1.08)
         axis.set_yticks([0.0, 0.5, 1.0])
         axis.yaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
-        axis.set_ylabel("Candidate source share")
+        axis.set_ylabel("Normalized visual support (%)")
 
     gain_values = np.asarray(point["accept_delta"], dtype=float)
     gain_intervals = intervals["accept_delta"]
@@ -295,7 +301,7 @@ def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> 
         gain_axis.axhline(0.0, color=GAIN_COLOR, linestyle=(0, (3, 2)), lw=0.7)
     gain_axis.set_ylim(-bound, bound)
     gain_axis.set_ylabel(
-        "Accepted-token gain vs. token-only",
+        "Accepted-prefix gain (tokens)\n(contextual − token-only)",
         color=RIGHT_AXIS_COLOR,
         fontsize=7.6,
         fontweight="bold",
@@ -338,7 +344,7 @@ def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> 
     axis.text(
         x[0],
         -0.13,
-        "Text-dominant",
+        "Token-only-aligned",
         transform=axis.get_xaxis_transform(),
         ha="center",
         va="top",
@@ -350,7 +356,7 @@ def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> 
     axis.text(
         x[-1],
         -0.13,
-        "Vision-dominant",
+        "Context-aligned",
         transform=axis.get_xaxis_transform(),
         ha="center",
         va="top",
@@ -380,7 +386,7 @@ def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> 
             markersize=5.2,
         )
     )
-    legend_labels.append("Accepted-token gain")
+    legend_labels.append("Accepted-prefix gain")
     fig.legend(
         handles,
         legend_labels,
@@ -393,10 +399,14 @@ def render(payload: dict, output_stem: Path, *, signed_margin: bool = False) -> 
         columnspacing=1.4,
     )
     fig.subplots_adjust(left=0.115, right=0.865, top=0.78, bottom=0.20)
+    if title:
+        fig.suptitle(title, y=0.99, fontsize=9.0, fontweight="bold", color=INK)
     for text in fig.findobj(match=Text):
         text.set_fontfamily(FONT_FAMILY)
     output_stem.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight", transparent=True)
+    with plt.rc_context({"pdf.fonttype": 42, "svg.fonttype": "none"}):
+        fig.savefig(output_stem.with_suffix(".pdf"), bbox_inches="tight", transparent=True)
+        fig.savefig(output_stem.with_suffix(".svg"), bbox_inches="tight", transparent=True)
     fig.savefig(
         output_stem.with_suffix(".png"),
         dpi=320,
